@@ -1,3 +1,9 @@
+# MSA-SM120: FlashAttention for NVIDIA Blackwell Consumer GPUs (RTX 5090 / RTX PRO 6000)
+
+> **One-liner:** Drop-in FlashAttention BF16 + FP8 kernels for SM120, using per-warp HMMA/QMMA.SF with hardware FP6/FP4 unpack — no TMA, no TMEM, works today on RTX 5090.
+
+---
+
 # Plan portu MSA na SM120 (RTX 5090)
 
 **Data:** 2026-06-12
