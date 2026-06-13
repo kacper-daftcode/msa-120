@@ -7,7 +7,16 @@ Provides fmha_sm100_plan() and fmha_sm100() interfaces
 with per-variant lazy JIT compilation.
 """
 
-from .api import fmha_sm100, fmha_sm100_plan, sparse_topk_select
+try:
+    from .api import fmha_sm100, fmha_sm100_plan, sparse_topk_select
+except (ImportError, ModuleNotFoundError):
+    # SM100 stack requires cutlass-dsl; gracefully skip if unavailable
+    fmha_sm100 = None
+    fmha_sm100_plan = None
+    sparse_topk_select = None
+
+# SM120 support (RTX 5090 / RTX PRO 6000) — no external deps beyond torch
+from .sm120_api import fmha_sm120, fmha_sm120_plan, is_sm120
 
 # Public symbols of the CuTe-DSL sparse stack (implemented in fmha_sm100.sparse).
 # Re-exported lazily so a bare ``import fmha_sm100`` does not pull in the
@@ -28,6 +37,9 @@ __all__ = [
     "fmha_sm100_plan",
     "fmha_sm100",
     "sparse_topk_select",
+    "fmha_sm120",
+    "fmha_sm120_plan",
+    "is_sm120",
     *sorted(_SPARSE_LAZY_EXPORTS),
 ]
 
