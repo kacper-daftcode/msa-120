@@ -41,3 +41,34 @@ docker run -d --name minimax-m3-nvfp4 --runtime=nvidia --gpus all --network host
 Replace the broken marlin path with a custom ModelOptNvFp4FusedMoE.apply override:
 NVFP4 gate_up GEMM (FlashInferB12xNvFp4LinearKernel, SM120-ok) -> swigluoai
 (torch, alpha 1.702/limit 7/contiguous) -> NVFP4 down GEMM. Per swiglu_moe_ref.py.
+
+## DIAGNOSIS UPDATE (confirmed findings)
+- **Weight remap is CORRECT**: M3 loader (model.py:828-833) expects exactly
+  w1=gate, w2=down, w3=up — our gate_proj->w1/up_proj->w3/down_proj->w2 matches.
+  Weights load into the right slots. Gibberish is NOT a remap bug.
+- **Gibberish = marlin-NVFP4 MoE numerics**: the forced-marlin NVFP4 + swigluoai
+  path (VLLM_TEST_FORCE_FP8_MARLIN, a test path) is numerically wrong on this
+  checkpoint despite scale handling. Not production-validated.
+- **Fused b12x CANNOT do swigluoai**: flashinfer.fused_moe.b12x_fused_moe only
+  supports activation in {"silu","relu2"} — no swigluoai. So the fast fused path
+  is out for M3 (which needs the clamped GPT-OSS SwiGLU).
+
+## THE FINISH (exact, fully specified): un-fused swigluoai NVFP4 MoE
+Subclass vllm .../fused_moe/experts/flashinfer_b12x_moe.py `FlashInferB12xExperts`
+(reuse its process_weights_after_loading: w1_sf_mma/w2_sf_mma via
+flashinfer_convert_sf_to_mma_layout, g1_alphas/g2_alphas global scales,
+fc2_input_scale). Override the forward to REPLACE the single
+`flashinfer_b12x_fused_moe(...)` call with un-fused:
+  1. route -> token_selected_experts/scales; sort tokens by expert -> m_indptr.
+  2. quantize x -> nvfp4 (a, a_scale) with input scale.
+  3. flashinfer.gemm.group_gemm_nvfp4_nt_groupwise(a, w1, a_scale, w1_sf_mma,
+     m_indptr, alpha=g1_alphas) -> gate_up [tok, 2I].
+  4. swigluoai (torch): gate=g[:I], up=g[I:]; (clamp(up,±7)+1)*clamp(gate,max=7)
+     *sigmoid(1.702*gate)  (contiguous halves; per swiglu_moe_ref.py).
+  5. quantize intermediate -> nvfp4 with fc2_input_scale.
+  6. group_gemm_nvfp4_nt_groupwise(.., w2, .., w2_sf_mma, m_indptr,
+     alpha=g2_alphas) -> down [tok, H]; scatter + topk-weighted combine.
+Then opt into it (select FLASHINFER_B12X + add to NVFP4_BACKENDS_WITH_CLAMP since
+it now applies the clamp). Validate output coherence vs the MXFP4 baseline.
+The hard part is the token-sort/m_indptr + intermediate nvfp4 quant that
+b12x_fused_moe currently does internally; everything else is reused.
