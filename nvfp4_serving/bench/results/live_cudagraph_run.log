@@ -1,0 +1,36 @@
+[bench] target http://localhost:8000/v1/completions  model=/models/MiniMax-M3-NVFP4
+[bench] waiting for server health ...
+[bench] server healthy.
+[bench] warmup done (2 reqs)
+[bench] decode @ bs1 ...
+[bench] prefill ...
+[bench] sweep concurrency=1 ...
+[bench] sweep concurrency=4 ...
+[bench] sweep concurrency=16 ...
+
+[bench] JSON written to /home/kacper/msa-120/nvfp4_serving/bench/results/live_cudagraph.json
+
+==============================================================================
+  MiniMax-M3-NVFP4 vLLM serving benchmark
+==============================================================================
+  host            : http://localhost:8000
+  model           : /models/MiniMax-M3-NVFP4
+  timestamp       : 2026-06-14T16:47:46+0000
+  conditions      : max-model-len 65536, block-size 128, bf16 KV, TP4, enforce-eager, gpu-mem-util 0.95
+------------------------------------------------------------------------------
+  DECODE @ batch size 1 (key interactive metric)
+    decode throughput : 90.45 tok/s (median over 5 reqs, 128 out-tok each)
+    TTFT              : 22.11 ms (median)
+    TPOT              : 11.056 ms/tok (median inter-token)
+------------------------------------------------------------------------------
+  PREFILL (~512-tok prompt, max_tokens=1)
+    prompt tokens     : 515
+    TTFT              : 93.14 ms (median)
+    prefill throughput: 5529.31 tok/s (median)
+------------------------------------------------------------------------------
+  OFFERED-LOAD SWEEP (system output throughput, all streams summed)
+     conc   out tok/s    req/s  per-req tok/s   TTFT ms   TPOT ms  fail
+        1       81.73   1.2771           91.4      92.0    10.939     0
+        4      244.33   3.8176          62.78     43.83    15.924     0
+       16      642.72  10.0425          41.22     61.06    24.277     0
+==============================================================================

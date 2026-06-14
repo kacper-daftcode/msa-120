@@ -30,3 +30,4 @@ profiles/
 *.swp
 .DS_Store
 tests/logs/
+.claude/
