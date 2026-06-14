@@ -164,6 +164,42 @@ __device__ void load_tile_async(
     }
 }
 
+// V SMEM swizzle (see dense kernel): XOR the column by ((row&7)<<3) so the
+// transposed PV reads (fixed col, varying row) spread across banks. The mask is
+// a multiple of 8, keeping cp.async 16B store chunks contiguous & aligned.
+// Logical (row,col) is unchanged — MMA fragment layout intact.
+__device__ __forceinline__ int v_swz(int row, int col) {
+    return row * HEAD_DIM + (col ^ ((row & 7) << 3));
+}
+
+__device__ void load_v_async_swz(
+    __nv_bfloat16 *smem_tile,
+    const __nv_bfloat16 *gmem,
+    int row_start,
+    int num_valid_rows,
+    int stride_row,
+    int tid,
+    int num_threads)
+{
+    const int elems_per_copy = 8;
+    const int total_elems = BLK_N * HEAD_DIM;
+    const int copies_per_thread = (total_elems + num_threads * elems_per_copy - 1)
+                                / (num_threads * elems_per_copy);
+    for (int c = 0; c < copies_per_thread; c++) {
+        int elem_idx = (tid + c * num_threads) * elems_per_copy;
+        if (elem_idx >= total_elems) break;
+        int row = elem_idx / HEAD_DIM;
+        int col = elem_idx % HEAD_DIM;
+        __nv_bfloat16 *dst = smem_tile + v_swz(row, col);
+        if (row < num_valid_rows) {
+            const __nv_bfloat16 *src = gmem + (row_start + row) * stride_row + col;
+            cp_async_16b(dst, src);
+        } else {
+            *reinterpret_cast<uint4*>(dst) = make_uint4(0, 0, 0, 0);
+        }
+    }
+}
+
 __device__ __forceinline__ uint32_t f32x2_to_bf16x2(float lo, float hi) {
     uint32_t r;
     reinterpret_cast<__nv_bfloat16*>(&r)[0] = __float2bfloat16(lo);
@@ -181,6 +217,42 @@ __device__ __forceinline__ uint32_t lds_u32(const void *smem_ptr) {
         "ld.shared.b32 %0, [%2];\n"
         "}\n" : "=r"(r), "+l"(smem_ptr), "=r"(smem_addr));
     return r;
+}
+
+// Convert a generic shared-memory pointer to the 32-bit .shared address space
+// offset that ldmatrix expects.
+__device__ __forceinline__ uint32_t smem_u32(const void *smem_ptr) {
+    uint32_t addr;
+    asm volatile(
+        "{\n"
+        ".reg .u64 u;\n"
+        "cvta.to.shared.u64 u, %1;\n"
+        "cvt.u32.u64 %0, u;\n"
+        "}\n" : "=r"(addr) : "l"(smem_ptr));
+    return addr;
+}
+
+// ldmatrix.x4: loads a full 16x16 BF16 fragment (4 regs) matching the
+// m16n8k16 A-operand thread distribution (lane l -> matrix l/8, row l%8).
+__device__ __forceinline__ void ldmatrix_x4(
+    uint32_t &r0, uint32_t &r1, uint32_t &r2, uint32_t &r3,
+    const void *row_ptr)
+{
+    uint32_t a = smem_u32(row_ptr);
+    asm volatile(
+        "ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
+        : "=r"(r0), "=r"(r1), "=r"(r2), "=r"(r3) : "r"(a));
+}
+
+// ldmatrix.x2: loads two 8x8 b16 matrices (2 regs) matching the m16n8k16
+// B-operand thread distribution (lanes 0-7 -> matrix 0, 8-15 -> matrix 1).
+__device__ __forceinline__ void ldmatrix_x2(
+    uint32_t &r0, uint32_t &r1, const void *row_ptr)
+{
+    uint32_t a = smem_u32(row_ptr);
+    asm volatile(
+        "ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0, %1}, [%2];\n"
+        : "=r"(r0), "=r"(r1) : "r"(a));
 }
 
 // ===========================================================================
@@ -240,6 +312,12 @@ sm120_fmha_sparse_bf16(
     const int qbase0   = (wm + grp) * HEAD_DIM;
     const int qbase1   = (wm + grp + 8) * HEAD_DIM;
     const int grp_hdim = grp * HEAD_DIM;
+
+    // ldmatrix lane mapping (see dense kernel for derivation).
+    const int q_ld_row  = wm + ((lid & 8) ? 8 : 0) + (lid & 7);
+    const int q_ld_koff = (lid & 16) ? 8 : 0;
+    const int k_ld_lo   = lid & 7;
+    const int k_ld_koff = (lid & 8) ? 8 : 0;
 
     const __nv_bfloat16 * __restrict__ sQ_a =
         static_cast<const __nv_bfloat16*>(__builtin_assume_aligned(sQ, 16));
@@ -325,9 +403,9 @@ sm120_fmha_sparse_bf16(
         cp_async_wait(0);
         __syncthreads();
 
-        // (2) Start V[kb] load → sV (overlaps with QK compute)
+        // (2) Start V[kb] load → sV (overlaps with QK compute), swizzled layout
         __nv_bfloat16 *sVc = sV;
-        load_tile_async(sVc, Vp, kvs, kvv, kvstride, tid, nthr);
+        load_v_async_swz(sVc, Vp, kvs, kvv, kvstride, tid, nthr);
         cp_async_commit();
 
         // (3) QK GEMM — interleaved B-fragment loads overlapping HMMA (pipe 30)
@@ -340,17 +418,18 @@ sm120_fmha_sparse_bf16(
         for (int i = 0; i < 8; i++)
             Sr[i][0] = Sr[i][1] = Sr[i][2] = Sr[i][3] = 0.f;
 
-        uint32_t b0_next = lds_u32(&sKc_a[grp_hdim + sub2]);
-        uint32_t b1_next = lds_u32(&sKc_a[grp_hdim + sub2 + 8]);
+        // B (K) fragments via ldmatrix.x2; A (Q) via ldmatrix.x4. One ldmatrix
+        // replaces 4 (A) / 2 (B) scalar lds_u32 + their address math.
+        uint32_t b0_next, b1_next;
+        ldmatrix_x2(b0_next, b1_next, &sKc_a[k_ld_lo * HEAD_DIM + k_ld_koff]);
 
         #pragma unroll
         for (int ks = 0; ks < 8; ks++) {
             const int qoff = ks * MMA_K_BF16;
 
-            uint32_t a0 = lds_u32(&sQ_a[qbase0 + qoff + sub2]);
-            uint32_t a1 = lds_u32(&sQ_a[qbase1 + qoff + sub2]);
-            uint32_t a2 = lds_u32(&sQ_a[qbase0 + qoff + sub2 + 8]);
-            uint32_t a3 = lds_u32(&sQ_a[qbase1 + qoff + sub2 + 8]);
+            uint32_t a0, a1, a2, a3;
+            ldmatrix_x4(a0, a1, a2, a3,
+                        &sQ_a[q_ld_row * HEAD_DIM + qoff + q_ld_koff]);
 
             #pragma unroll
             for (int nt = 0; nt < 8; nt++) {
@@ -363,13 +442,13 @@ sm120_fmha_sparse_bf16(
                     Sr[nt][0], Sr[nt][1], Sr[nt][2], Sr[nt][3]);
 
                 if (nt < 7) {
-                    const int kr_n = ((nt + 1) * MMA_N + grp) * HEAD_DIM + qoff;
-                    b0_next = lds_u32(&sKc_a[kr_n + sub2]);
-                    b1_next = lds_u32(&sKc_a[kr_n + sub2 + 8]);
+                    const int kr = ((nt + 1) * MMA_N + k_ld_lo) * HEAD_DIM
+                                   + qoff + k_ld_koff;
+                    ldmatrix_x2(b0_next, b1_next, &sKc_a[kr]);
                 } else if (ks < 7) {
-                    const int kr_n = grp_hdim + (ks + 1) * MMA_K_BF16;
-                    b0_next = lds_u32(&sKc_a[kr_n + sub2]);
-                    b1_next = lds_u32(&sKc_a[kr_n + sub2 + 8]);
+                    const int kr = k_ld_lo * HEAD_DIM
+                                   + (ks + 1) * MMA_K_BF16 + k_ld_koff;
+                    ldmatrix_x2(b0_next, b1_next, &sKc_a[kr]);
                 }
             }
         }
@@ -532,15 +611,15 @@ sm120_fmha_sparse_bf16(
             // Preload first V fragment (dt=0, col = 0*8+grp = grp)
             int vcol = grp;
             uint32_t vb0_next = f32x4_to_e4m3x4(
-                __bfloat162float(sVc_a[vr_lo * HEAD_DIM + vcol]),
-                __bfloat162float(sVc_a[(vr_lo + 1) * HEAD_DIM + vcol]),
-                __bfloat162float(sVc_a[(vr_lo + 2) * HEAD_DIM + vcol]),
-                __bfloat162float(sVc_a[(vr_lo + 3) * HEAD_DIM + vcol]));
+                __bfloat162float(sVc_a[v_swz(vr_lo,     vcol)]),
+                __bfloat162float(sVc_a[v_swz(vr_lo + 1, vcol)]),
+                __bfloat162float(sVc_a[v_swz(vr_lo + 2, vcol)]),
+                __bfloat162float(sVc_a[v_swz(vr_lo + 3, vcol)]));
             uint32_t vb1_next = f32x4_to_e4m3x4(
-                __bfloat162float(sVc_a[vr_hi * HEAD_DIM + vcol]),
-                __bfloat162float(sVc_a[(vr_hi + 1) * HEAD_DIM + vcol]),
-                __bfloat162float(sVc_a[(vr_hi + 2) * HEAD_DIM + vcol]),
-                __bfloat162float(sVc_a[(vr_hi + 3) * HEAD_DIM + vcol]));
+                __bfloat162float(sVc_a[v_swz(vr_hi,     vcol)]),
+                __bfloat162float(sVc_a[v_swz(vr_hi + 1, vcol)]),
+                __bfloat162float(sVc_a[v_swz(vr_hi + 2, vcol)]),
+                __bfloat162float(sVc_a[v_swz(vr_hi + 3, vcol)]));
 
             #pragma unroll
             for (int dt = 0; dt < 16; dt++) {
@@ -558,15 +637,15 @@ sm120_fmha_sparse_bf16(
                 if (dt < 15) {
                     vcol = (dt + 1) * MMA_N + grp;
                     vb0_next = f32x4_to_e4m3x4(
-                        __bfloat162float(sVc_a[vr_lo * HEAD_DIM + vcol]),
-                        __bfloat162float(sVc_a[(vr_lo + 1) * HEAD_DIM + vcol]),
-                        __bfloat162float(sVc_a[(vr_lo + 2) * HEAD_DIM + vcol]),
-                        __bfloat162float(sVc_a[(vr_lo + 3) * HEAD_DIM + vcol]));
+                        __bfloat162float(sVc_a[v_swz(vr_lo,     vcol)]),
+                        __bfloat162float(sVc_a[v_swz(vr_lo + 1, vcol)]),
+                        __bfloat162float(sVc_a[v_swz(vr_lo + 2, vcol)]),
+                        __bfloat162float(sVc_a[v_swz(vr_lo + 3, vcol)]));
                     vb1_next = f32x4_to_e4m3x4(
-                        __bfloat162float(sVc_a[vr_hi * HEAD_DIM + vcol]),
-                        __bfloat162float(sVc_a[(vr_hi + 1) * HEAD_DIM + vcol]),
-                        __bfloat162float(sVc_a[(vr_hi + 2) * HEAD_DIM + vcol]),
-                        __bfloat162float(sVc_a[(vr_hi + 3) * HEAD_DIM + vcol]));
+                        __bfloat162float(sVc_a[v_swz(vr_hi,     vcol)]),
+                        __bfloat162float(sVc_a[v_swz(vr_hi + 1, vcol)]),
+                        __bfloat162float(sVc_a[v_swz(vr_hi + 2, vcol)]),
+                        __bfloat162float(sVc_a[v_swz(vr_hi + 3, vcol)]));
                 }
             }
         }

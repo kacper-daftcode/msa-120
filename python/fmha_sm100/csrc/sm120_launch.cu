@@ -43,8 +43,10 @@ std::vector<torch::Tensor> sm120_fmha_forward_bf16(
     dim3 grid(num_m_blocks, num_heads_q);
     dim3 block(128);
 
-    // Q(16KB) + K(16KB, single-buffer) + V(16KB) = 48KB → 2 blocks/SM
-    const int smem_bytes = 64 * 128 * 2 * 3;
+    // Q(16KB) + K(16KB, single-buffer) + V(16KB) = 48KB.
+    // The kernel uses NUM_STAGES=1; allocating only 48KB (vs the old 64KB)
+    // lets 2 blocks/SM fit instead of 1 (SMEM was the occupancy limiter).
+    const int smem_bytes = 64 * 128 * 2 + 64 * 128 * 2 + 64 * 128 * 2;
 
     cudaFuncSetAttribute(sm120_fmha_fwd_bf16,
         cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes);
@@ -85,10 +87,8 @@ std::vector<torch::Tensor> sm120_fmha_forward_fp8(
     dim3 grid(num_m_blocks, num_heads_q);
     dim3 block(128);
 
-    // FP8 SMEM: Q(8KB) + K(8KB) + V(8KB) = 24KB (single-buffered — must match
-    // SMEM_TOTAL in the kernel; the previous 2x K/V over-allocation halved
-    // occupancy from 4 to 2 blocks/SM for no benefit).
-    const int smem_bytes = 64 * 128 * 1 * 3;
+    // FP8 SMEM: Q(8KB) + K(8KB) + V(8KB) = 24KB
+    const int smem_bytes = 64 * 128 * 1 + 64 * 128 * 1 * 2 + 64 * 128 * 1 * 2;
 
     cudaFuncSetAttribute(sm120_fmha_fwd_fp8,
         cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes);
