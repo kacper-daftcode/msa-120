@@ -41,7 +41,7 @@ sudo docker run -d --name minimax-m3-nvfp4 --runtime=nvidia --gpus all \
   --tensor-parallel-size 4 \
   --block-size 128 \
   --max-model-len 65536 \
-  --gpu-memory-utilization 0.95 \
+  --gpu-memory-utilization 0.977 \
   ${EAGER_FLAG} \
   --tool-call-parser minimax_m3 \
   --reasoning-parser minimax_m3 \
