@@ -43,8 +43,8 @@ std::vector<torch::Tensor> sm120_fmha_forward_bf16(
     dim3 grid(num_m_blocks, num_heads_q);
     dim3 block(128);
 
-    // Q(16KB) + K(32KB, 2-stage) + V(16KB, single-stage) = 64KB
-    const int smem_bytes = 64 * 128 * 2 + 64 * 128 * 2 * 2 + 64 * 128 * 2;
+    // Q(16KB) + K(16KB, single-buffer) + V(16KB) = 48KB → 2 blocks/SM
+    const int smem_bytes = 64 * 128 * 2 * 3;
 
     cudaFuncSetAttribute(sm120_fmha_fwd_bf16,
         cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes);

@@ -40,7 +40,10 @@ static constexpr int BLK_N = 64;
 static constexpr int HEAD_DIM = 128;
 static constexpr int NUM_WARPS = 4;
 static constexpr int WARP_M = BLK_M / NUM_WARPS;
-static constexpr int NUM_STAGES = 2;
+static constexpr int NUM_STAGES = 1;   // single-buffer K: 64KB->48KB SMEM,
+                                       // occupancy 1->2 blocks/SM. The 2-stage
+                                       // K prefetch bought nothing (ncu: DRAM
+                                       // 1.3%, L2 hit 97.5% — not memory bound).
 
 static constexpr int MMA_M = 16;
 static constexpr int MMA_N = 8;
@@ -247,30 +250,23 @@ sm120_fmha_fwd_bf16(
     const int nkvblk = (seq_len_k + BLK_N - 1) / BLK_N;
     constexpr float LG2E = 1.4426950408889634f;
 
-    // ===== PROLOGUE: kick off K[0] load into sK[stage 0] =====
-    {
-        const int kvv0 = min(BLK_N, seq_len_k);
-        load_tile_async(sK + 0 * BLK_N * HEAD_DIM, Kp, 0, kvv0, kvstride, tid, nthr);
-        cp_async_commit();
-    }
-
     for (int kb = 0; kb < nkvblk; kb++) {
-        const int stage = kb & 1;
-        const int next_stage = (kb + 1) & 1;
         const int kvs = kb * BLK_N;
         const int kvv = min(BLK_N, seq_len_k - kvs);
 
-        // (1) Wait for K[kb] in sK[stage]
+        // (1) Load K[kb] → sK (single-buffer) and wait
+        load_tile_async(sK, Kp, kvs, kvv, kvstride, tid, nthr);
+        cp_async_commit();
         cp_async_wait(0);
         __syncthreads();
 
-        // (2) Start V[kb] load → sV (single-stage, overlaps with QK compute)
+        // (2) Start V[kb] load → sV (overlaps with QK compute)
         __nv_bfloat16 *sVc = sV;
         load_tile_async(sVc, Vp, kvs, kvv, kvstride, tid, nthr);
         cp_async_commit();
 
         // (3) QK GEMM — interleaved B-fragment loads overlapping HMMA (pipe 30)
-        __nv_bfloat16 *sKc = sK + stage * BLK_N * HEAD_DIM;
+        __nv_bfloat16 *sKc = sK;
         const __nv_bfloat16 * __restrict__ sKc_a =
             static_cast<const __nv_bfloat16*>(__builtin_assume_aligned(sKc, 16));
 
@@ -393,20 +389,9 @@ sm120_fmha_fwd_bf16(
             *reinterpret_cast<uint16_t*>(&sP[(wm + grp + 8) * BLK_N + kv_col]) = pair_hi;
         }
 
-        // (5) Prefetch K[kb+1] → sK[next_stage] (overlaps with PV GEMM)
-        if (kb + 1 < nkvblk) {
-            const int next_kvs = (kb + 1) * BLK_N;
-            const int next_kvv = min(BLK_N, seq_len_k - next_kvs);
-            load_tile_async(sK + next_stage * BLK_N * HEAD_DIM,
-                            Kp, next_kvs, next_kvv, kvstride, tid, nthr);
-            cp_async_commit();
-        }
-
-        // (6) Wait for V[kb] — use wait(1) when K[kb+1] is in flight
-        if (kb + 1 < nkvblk)
-            cp_async_wait(1);
-        else
-            cp_async_wait(0);
+        // (5) Wait for V[kb] (single-buffer: K[kb+1] loads at top of next iter,
+        //     after PV consumes sP which aliases sK)
+        cp_async_wait(0);
         __syncthreads();
 
         // (7) PV GEMM — QMMA.SF FP8 m16n8k32 on pipe 37 (INT_ARITH)
