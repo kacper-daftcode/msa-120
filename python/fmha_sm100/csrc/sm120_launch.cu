@@ -85,8 +85,10 @@ std::vector<torch::Tensor> sm120_fmha_forward_fp8(
     dim3 grid(num_m_blocks, num_heads_q);
     dim3 block(128);
 
-    // FP8 SMEM: Q(8KB) + K(8KB) + V(8KB) = 24KB
-    const int smem_bytes = 64 * 128 * 1 + 64 * 128 * 1 * 2 + 64 * 128 * 1 * 2;
+    // FP8 SMEM: Q(8KB) + K(8KB) + V(8KB) = 24KB (single-buffered — must match
+    // SMEM_TOTAL in the kernel; the previous 2x K/V over-allocation halved
+    // occupancy from 4 to 2 blocks/SM for no benefit).
+    const int smem_bytes = 64 * 128 * 1 * 3;
 
     cudaFuncSetAttribute(sm120_fmha_fwd_fp8,
         cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes);

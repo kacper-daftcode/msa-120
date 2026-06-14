@@ -79,6 +79,18 @@ __device__ __forceinline__ uint32_t f32x2_to_bf16x2(float lo, float hi) {
     return r;
 }
 
+// Hardware FP8(E4M3)x2 -> BF16x2. Packs two FP8 bytes (lo -> low bf16,
+// hi -> high bf16) and converts via the hardware fp8x2->half2 unit, replacing
+// the branchy software fp8e4m3_to_f32 dependency chain that dominated PV-GEMM
+// latency (ncu: "fixed latency execution dependency", 43% of stall cycles).
+__device__ __forceinline__ uint32_t fp8x2_to_bf16x2(uint8_t lo, uint8_t hi) {
+    __nv_fp8x2_storage_t packed =
+        (__nv_fp8x2_storage_t)((uint16_t)lo | ((uint16_t)hi << 8));
+    __half2_raw hr = __nv_cvt_fp8x2_to_halfraw2(packed, __NV_E4M3);
+    float2 f = __half22float2(*reinterpret_cast<__half2*>(&hr));
+    return f32x2_to_bf16x2(f.x, f.y);
+}
+
 // ==================== MMA wrappers ====================
 
 __device__ __forceinline__ void qmma_sf_fp8_m16n8k32(
@@ -355,12 +367,12 @@ sm120_fmha_fwd_fp8(
                 const int vc = dt * MMA_N + grp;
                 const int vr = ns * MMA_K_BF16 + sub * 2;
 
-                uint32_t vb0 = f32x2_to_bf16x2(
-                    fp8e4m3_to_f32(sV[ vr      * HEAD_DIM + vc]),
-                    fp8e4m3_to_f32(sV[(vr + 1) * HEAD_DIM + vc]));
-                uint32_t vb1 = f32x2_to_bf16x2(
-                    fp8e4m3_to_f32(sV[(vr + 8) * HEAD_DIM + vc]),
-                    fp8e4m3_to_f32(sV[(vr + 9) * HEAD_DIM + vc]));
+                uint32_t vb0 = fp8x2_to_bf16x2(
+                    sV[ vr      * HEAD_DIM + vc],
+                    sV[(vr + 1) * HEAD_DIM + vc]);
+                uint32_t vb1 = fp8x2_to_bf16x2(
+                    sV[(vr + 8) * HEAD_DIM + vc],
+                    sV[(vr + 9) * HEAD_DIM + vc]);
 
                 hmma_bf16_m16n8k16(
                     Oa[dt][0], Oa[dt][1], Oa[dt][2], Oa[dt][3],
