@@ -24,6 +24,7 @@ sm120_fmha = load(
     sources=[
         os.path.join(_CSRC, "sm120_launch.cu"),
         os.path.join(_CSRC, "sm120_fmha_fwd.cu"),
+        os.path.join(_CSRC, "sm120_fmha_fwd_fp8.cu"),
     ],
     extra_cuda_cflags=[
         "-gencode=arch=compute_120f,code=sm_120f",
