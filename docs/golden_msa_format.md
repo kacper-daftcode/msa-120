@@ -100,6 +100,49 @@ metadata):
 - **LSE / normalization**: no LSE tensor is provided to cross-check softmax
   normalization base or sparse renormalization.
 
+### Stage C addendum — convention diagnostic resolves it: NOT NVFP4-KV
+`tests/diag_nvfp4_convention.py` (pure torch, no kernel) sweeps every plausible
+convention against golden `sparse_out`. Results:
+
+| KV-prec | block_size | causal | rel-rms vs golden sparse_out |
+|---------|-----------:|--------|------------------------------:|
+| bf16    | 64         | no/yes | **1.5486** |
+| bf16    | 128        | no     | 1.1464 (best of sweep) |
+| bf16    | 128        | yes    | 1.1472 |
+| NVFP4   | 64         | no/yes | 1.5501 |
+| NVFP4   | 128        | no/yes | 1.1499 / 1.1507 |
+
+Key facts from the same script:
+
+- **NVFP4-KV is a red herring for v1.** Quantizing K/V to the checkpoint's NVFP4
+  scheme (block-16 E2M1 + E4M3 per-block scale + fp32 global; K/V quant error
+  ≈0.095 rel-rms each) does **not** reduce the gap — it slightly *increases* it.
+  The dense anchor is conclusive: full-causal with **bf16** KV is 0.0023 vs
+  golden `dense_out`, but with **NVFP4** KV it jumps to **0.1335**. So the
+  capture used plain bf16 K/V, not NVFP4-KV. Implementing an NVFP4-KV kernel
+  would therefore *not* close the sparse gap. No kernel was shipped.
+- **block_size 128 helps but does not close** (1.55 → 1.15); **causal vs
+  non-causal is a no-op** here (every golden block id ≤63 sits far below each
+  query's right-aligned causal horizon, so nothing is masked).
+- **Structural smoking gun.** golden `sparse_out` rows have norm ≈0.42 while our
+  block-sparse softmax over the golden indices has norm ≈0.58 but is nearly
+  orthogonal to golden (mean row-cosine **0.18**). golden `dense_out` is *more*
+  aligned to golden `sparse_out` (cosine **0.53**) than our reconstruction is.
+- **Assumption-free oracle test.** A greedy search that may pick *any* 16 of the
+  128 blocks (unconstrained by the golden indices) still cannot reach golden
+  `sparse_out`: best rel-rms **0.70–0.92**, and the recovered blocks overlap the
+  golden `kv_block_indexes` by only **1–3 / 16** (and include blocks >63 that the
+  indexer never selects).
+
+**Resolved interpretation:** golden `sparse_out` is **not** a block-sparse
+softmax over the captured `q / k_pages / v_pages` using the captured
+`kv_block_indexes` — by *any* KV precision, block size, mask, or even oracle
+selection. The 1.55 gap is a **capture-side decoupling** (the `sparse_out`
+tensor was produced from a different RoPE phase / head permutation / KV
+projection than the captured q/K/V and indices), not NVFP4-KV, not block
+geometry, not normalization, and not our kernel. Because the dense anchor proves
+bf16 KV, there is **nothing for an NVFP4-KV kernel to fix** in this v1 capture.
+
 ### Stage D — dense convention anchor — **CONFIRMED**
 Torch full **causal** attention (right-aligned: query *i* sees keys
 `[0 .. seq_k-seq_q+i]`) vs golden `dense_out`:
