@@ -197,7 +197,10 @@ sm120_fmha_sparse_bf16(
     int seq_len_k,
     int num_heads_q,
     int num_heads_kv,
-    float softmax_scale)
+    float softmax_scale,
+    int causal,
+    int per_query,            // 0: block_ids[m_blk,topk]; 1: block_ids[qrow,topk]
+    int blk_kv)               // KV block size in tokens (64 or 128)
 {
     extern __shared__ __nv_bfloat16 smem_raw[];
 
@@ -251,12 +254,69 @@ sm120_fmha_sparse_bf16(
 
     constexpr float LG2E = 1.4426950408889634f;
 
-    // Block-sparse: iterate only the KV blocks selected for this query tile.
-    const int *blk_row = block_ids + m_blk * topk;
-    for (int t = 0; t < topk; t++) {
-        const int kb = blk_row[t];
+    const int num_kv_blocks = (seq_len_k + blk_kv - 1) / blk_kv;  // blk_kv-sized blocks
+
+    // -----------------------------------------------------------------
+    // Per-query mode: build the UNION of blocks selected by any of the
+    // 64 rows in this tile (deduplicated) into shared memory.
+    // s_present[b]=1 if block b is selected by some row; s_union packs
+    // the distinct block ids; s_meta[0] holds the union count.
+    // -----------------------------------------------------------------
+    int *s_present = reinterpret_cast<int*>(sV + BLK_N * HEAD_DIM);
+    int *s_union   = s_present + num_kv_blocks;
+    int *s_meta    = s_union + num_kv_blocks;     // [0]=union count
+    int n_iter;
+    const int *iter_blocks;                        // list of blocks to iterate
+    const int *blk_row = block_ids + m_blk * topk; // per-tile row
+
+    if (per_query) {
+        // clear presence
+        for (int b = tid; b < num_kv_blocks; b += nthr) s_present[b] = 0;
+        if (tid == 0) s_meta[0] = 0;
+        __syncthreads();
+        // each thread owns its two query rows; mark their selected blocks.
+        // (rows beyond seq_len_q simply read padded ids; mark guarded below)
+        const int my_r0 = qstart + wm + grp;
+        const int my_r1 = qstart + wm + grp + 8;
+        if (sub == 0) {                            // 1 lane per (r0,r1) pair
+            #pragma unroll 1
+            for (int t = 0; t < topk; t++) {
+                if (my_r0 < seq_len_q) {
+                    int b = block_ids[my_r0 * topk + t];
+                    if (b >= 0 && b < num_kv_blocks) atomicExch(&s_present[b], 1);
+                }
+                if (my_r1 < seq_len_q) {
+                    int b = block_ids[my_r1 * topk + t];
+                    if (b >= 0 && b < num_kv_blocks) atomicExch(&s_present[b], 1);
+                }
+            }
+        }
+        __syncthreads();
+        // compact present blocks into s_union (single thread, in order)
+        if (tid == 0) {
+            int c = 0;
+            for (int b = 0; b < num_kv_blocks; b++)
+                if (s_present[b]) s_union[c++] = b;
+            s_meta[0] = c;
+        }
+        __syncthreads();
+        n_iter = s_meta[0];
+        iter_blocks = s_union;
+    } else {
+        n_iter = topk;
+        iter_blocks = blk_row;
+    }
+
+    // Block-sparse: iterate selected KV blocks (per-tile row or per-query union).
+    // blk_kv-sized blocks are processed as (blk_kv / BLK_N) sub-tiles of
+    // BLK_N=64 tokens each, reusing the 64-wide GEMM machinery verbatim.
+    const int n_sub = blk_kv / BLK_N;
+    for (int t = 0; t < n_iter; t++) {
+        const int kb = iter_blocks[t];
         if (kb < 0) continue;                       // -1 padding
-        const int kvs = kb * BLK_N;
+      for (int sub_tile = 0; sub_tile < n_sub; sub_tile++) {
+        const int kvs = kb * blk_kv + sub_tile * BLK_N;
+        if (kvs >= seq_len_k) continue;             // sub-tile fully out of range
         const int kvv = min(BLK_N, seq_len_k - kvs);
 
         // (1) Load K[kb] → sK (single-buffer) and wait
@@ -332,6 +392,45 @@ sm120_fmha_sparse_bf16(
             }
         }
 
+        // (3b) Causal mask: query at abs row qpos attends kpos only if kpos<=qpos.
+        // Sr[nt][0],[1] -> row q_r0 ; Sr[nt][2],[3] -> row q_r1.
+        // KV abs positions: kvs + nt*8 + sub*2 (col0) and +1 (col1).
+        if (causal) {
+            const int q_r0 = qstart + wm + grp;
+            const int q_r1 = qstart + wm + grp + 8;
+            #pragma unroll
+            for (int nt = 0; nt < 8; nt++) {
+                int kp0 = kvs + nt * MMA_N + sub * 2;
+                int kp1 = kp0 + 1;
+                if (kp0 > q_r0) Sr[nt][0] = -INFINITY;
+                if (kp1 > q_r0) Sr[nt][1] = -INFINITY;
+                if (kp0 > q_r1) Sr[nt][2] = -INFINITY;
+                if (kp1 > q_r1) Sr[nt][3] = -INFINITY;
+            }
+        }
+
+        // (3c) Per-query membership: in per_query mode the tile iterates the
+        // UNION of blocks; a given row only attends kb if kb is in ITS own
+        // top-k list. Rows that did NOT select kb get -inf for this block.
+        if (per_query) {
+            const int q_r0 = qstart + wm + grp;
+            const int q_r1 = qstart + wm + grp + 8;
+            bool sel0 = false, sel1 = false;
+            #pragma unroll 1
+            for (int tt = 0; tt < topk; tt++) {
+                if (q_r0 < seq_len_q && block_ids[q_r0 * topk + tt] == kb) sel0 = true;
+                if (q_r1 < seq_len_q && block_ids[q_r1 * topk + tt] == kb) sel1 = true;
+            }
+            if (!sel0) {
+                #pragma unroll
+                for (int nt = 0; nt < 8; nt++) { Sr[nt][0] = -INFINITY; Sr[nt][1] = -INFINITY; }
+            }
+            if (!sel1) {
+                #pragma unroll
+                for (int nt = 0; nt < 8; nt++) { Sr[nt][2] = -INFINITY; Sr[nt][3] = -INFINITY; }
+            }
+        }
+
         // (4) Online softmax
         float mx0 = -INFINITY, mx1 = -INFINITY;
         #pragma unroll
@@ -360,13 +459,17 @@ sm120_fmha_sparse_bf16(
             Oa[d][2] *= s1; Oa[d][3] *= s1;
         }
 
+        // Fully-masked rows have mn==-inf; Sr-mn would be -inf-(-inf)=NaN.
+        // Force probabilities to 0 in that case (matches ref nan_to_num).
+        const bool dead0 = (mn0 == -INFINITY);
+        const bool dead1 = (mn1 == -INFINITY);
         float ls0 = 0.f, ls1 = 0.f;
         #pragma unroll
         for (int i = 0; i < 8; i++) {
-            Sr[i][0] = exp2f(LG2E * (Sr[i][0] - mn0));
-            Sr[i][1] = exp2f(LG2E * (Sr[i][1] - mn0));
-            Sr[i][2] = exp2f(LG2E * (Sr[i][2] - mn1));
-            Sr[i][3] = exp2f(LG2E * (Sr[i][3] - mn1));
+            Sr[i][0] = dead0 ? 0.f : exp2f(LG2E * (Sr[i][0] - mn0));
+            Sr[i][1] = dead0 ? 0.f : exp2f(LG2E * (Sr[i][1] - mn0));
+            Sr[i][2] = dead1 ? 0.f : exp2f(LG2E * (Sr[i][2] - mn1));
+            Sr[i][3] = dead1 ? 0.f : exp2f(LG2E * (Sr[i][3] - mn1));
             ls0 += Sr[i][0] + Sr[i][1];
             ls1 += Sr[i][2] + Sr[i][3];
         }
@@ -470,6 +573,7 @@ sm120_fmha_sparse_bf16(
 
         // (8) Ensure all warps done before next iteration reuses shared memory
         __syncthreads();
+      } // sub_tile
     }
 
     // ----- epilogue -----
@@ -509,12 +613,13 @@ sm120_fmha_sparse_bf16(
 // selected KV blocks of BLK_N=64 tokens; -1 = pad). Non-causal v0.
 std::vector<torch::Tensor> forward_sparse_bf16(
     torch::Tensor q, torch::Tensor k, torch::Tensor v,
-    torch::Tensor block_ids, double softmax_scale)
+    torch::Tensor block_ids, double softmax_scale, bool causal, int64_t blk_kv)
 {
+    TORCH_CHECK(blk_kv == 64 || blk_kv == 128, "blk_kv must be 64 or 128");
     TORCH_CHECK(q.is_cuda() && q.dtype() == torch::kBFloat16 && q.dim() == 3 && q.size(2) == 128,
                 "q must be CUDA bf16 [Sq,Hq,128]");
     TORCH_CHECK(block_ids.is_cuda() && block_ids.dtype() == torch::kInt32 && block_ids.dim() == 2,
-                "block_ids must be CUDA int32 [num_m_blocks,topk]");
+                "block_ids must be CUDA int32 [num_m_blocks,topk] or [seq_q,topk]");
     q = q.contiguous(); k = k.contiguous(); v = v.contiguous();
     block_ids = block_ids.contiguous();
 
@@ -523,7 +628,14 @@ std::vector<torch::Tensor> forward_sparse_bf16(
     const int topk = block_ids.size(1);
     const int BLK_M = 64;
     const int num_m_blocks = (seq_q + BLK_M - 1) / BLK_M;
-    TORCH_CHECK(block_ids.size(0) == num_m_blocks, "block_ids rows must equal num_m_blocks");
+    const int num_kv_blocks = (seq_k + (int)blk_kv - 1) / (int)blk_kv;
+
+    // Auto-detect block_ids layout: [num_m_blocks,topk] (per-tile) or
+    // [seq_q,topk] (per-query). Prefer per-tile when ambiguous.
+    int per_query;
+    if (block_ids.size(0) == num_m_blocks)      per_query = 0;
+    else if (block_ids.size(0) == seq_q)        per_query = 1;
+    else { TORCH_CHECK(false, "block_ids rows must equal num_m_blocks or seq_q"); per_query = 0; }
 
     auto o = torch::zeros_like(q);
     auto lse = torch::zeros({seq_q, num_heads_q},
@@ -531,7 +643,9 @@ std::vector<torch::Tensor> forward_sparse_bf16(
 
     dim3 grid(num_m_blocks, num_heads_q);
     dim3 block(128);
-    const int smem_bytes = 64 * 128 * 2 * 3;   // 48KB single-buffer
+    int smem_bytes = 64 * 128 * 2 * 3;   // 48KB single-buffer (Q/K/V)
+    if (per_query)                       // union scratch: present+union+meta
+        smem_bytes += (2 * num_kv_blocks + 1) * (int)sizeof(int);
     cudaFuncSetAttribute(sm120_fmha_sparse_bf16,
         cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes);
 
@@ -543,10 +657,14 @@ std::vector<torch::Tensor> forward_sparse_bf16(
         reinterpret_cast<__nv_bfloat16*>(o.data_ptr()),
         lse.data_ptr<float>(),
         block_ids.data_ptr<int>(), topk,
-        seq_q, seq_k, num_heads_q, num_heads_kv, (float)softmax_scale);
+        seq_q, seq_k, num_heads_q, num_heads_kv, (float)softmax_scale,
+        causal ? 1 : 0, per_query, (int)blk_kv);
     return {o, lse};
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.def("forward_sparse", &forward_sparse_bf16, "SM120 block-sparse FA2 forward (BF16)");
+    m.def("forward_sparse", &forward_sparse_bf16, "SM120 block-sparse FA2 forward (BF16)",
+          pybind11::arg("q"), pybind11::arg("k"), pybind11::arg("v"),
+          pybind11::arg("block_ids"), pybind11::arg("softmax_scale"),
+          pybind11::arg("causal") = false, pybind11::arg("blk_kv") = 64);
 }
