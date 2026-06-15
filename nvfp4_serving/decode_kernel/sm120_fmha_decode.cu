@@ -552,6 +552,86 @@ sm120_fmha_decode_merge_bf16_v2(
 }
 
 // ===========================================================================
+// MERGE KERNEL — CHUNK-PARALLEL (for high chunk counts, e.g. key-split 32).
+//   grid = (R, Hq). block = 128 = 4 warps x 32 lanes. The CHUNK reduction is
+//   split across the 4 warps: warp w reduces chunks [w, w+4, w+8, ...]; each lane
+//   owns 4 of the 128 dims (lane d -> dims {d, d+32, d+64, d+96}). This cuts the
+//   per-thread serial O-load chain from `chunks` to `chunks/4`, attacking the
+//   merge's long-scoreboard O-load latency (measured 48% at 32 chunks). The 4
+//   warp-partials (running max + denom + weighted-O) are combined via a small
+//   smem LSE merge. Same numerics as the flat merge.
+// ===========================================================================
+extern "C" __global__ void __launch_bounds__(128)
+sm120_fmha_decode_merge_bf16_par(
+    const __nv_bfloat16 * __restrict__ O_part, // [R, Hkv, GQA, C, 128] bf16
+    const float * __restrict__ M_part,
+    const float * __restrict__ L_part,
+    __nv_bfloat16 * __restrict__ O,           // [R, Hq, 128]
+    float * __restrict__ LSE,
+    int split_chunks,
+    int num_heads_q,
+    int num_heads_kv)
+{
+    const int req = blockIdx.x;
+    const int hq  = blockIdx.y;
+    const int gqa = num_heads_q / num_heads_kv;
+    const int hkv = hq / gqa;
+    const int g   = hq % gqa;
+    const int lane = threadIdx.x % 32;     // 0..31 -> dims {lane, +32, +64, +96}
+    const int warp = threadIdx.x / 32;     // 0..3  -> chunk stripe
+    constexpr float LG2E = 1.4426950408889634f;
+
+    const int64_t head_row = ((int64_t)req*num_heads_kv + hkv)*gqa + g;
+    const float * __restrict__ Mc = M_part + head_row*split_chunks;
+    const float * __restrict__ Lc = L_part + head_row*split_chunks;
+    const __nv_bfloat16 * __restrict__ Oc = O_part + head_row*split_chunks*HEAD_DIM;
+
+    // ---- per-warp partial over its chunk stripe ----
+    float wmax = -INFINITY;
+    for (int c = warp; c < split_chunks; c += 4) wmax = fmaxf(wmax, Mc[c]);
+    float acc[4] = {0.f,0.f,0.f,0.f};       // dims {lane,+32,+64,+96}
+    float wden = 0.f;
+    for (int c = warp; c < split_chunks; c += 4) {
+        float m = Mc[c]; if (m == -INFINITY) continue;
+        float w = exp2f(LG2E*(m - wmax));
+        float l = Lc[c]; wden += (l>0.f? l*w : 0.f);
+        const __nv_bfloat16 *op = Oc + (int64_t)c*HEAD_DIM + lane;
+        acc[0]+=__bfloat162float(op[0])  *w;
+        acc[1]+=__bfloat162float(op[32]) *w;
+        acc[2]+=__bfloat162float(op[64]) *w;
+        acc[3]+=__bfloat162float(op[96]) *w;
+    }
+    // ---- combine the 4 warp-partials via smem LSE merge ----
+    __shared__ float sM[4];                 // per-warp max
+    __shared__ float sScale[4];             // exp2(wmax_w - gmax)
+    if (lane == 0) sM[warp] = wmax;
+    __syncthreads();
+    float gmax = fmaxf(fmaxf(sM[0],sM[1]), fmaxf(sM[2],sM[3]));
+    float sc = (wmax == -INFINITY) ? 0.f : exp2f(LG2E*(wmax - gmax));
+    if (lane == 0) sScale[warp] = sc;
+    // rescale this warp's denom + O by sc, then reduce across warps in smem.
+    __shared__ float sDen[4];
+    __shared__ float sO[4][128];            // [warp][dim] rescaled weighted-O
+    if (lane == 0) sDen[warp] = wden * sc;
+    sO[warp][lane]    = acc[0]*sc;
+    sO[warp][lane+32] = acc[1]*sc;
+    sO[warp][lane+64] = acc[2]*sc;
+    sO[warp][lane+96] = acc[3]*sc;
+    __syncthreads();
+    // warp 0 finalizes (128 dims across its 32 lanes x 4).
+    float denom = sDen[0]+sDen[1]+sDen[2]+sDen[3];
+    float inv = (denom > 0.f) ? (1.f/denom) : 0.f;
+    #pragma unroll
+    for (int j=0;j<4;j++){
+        int d = lane + 32*j;
+        float o = sO[0][d]+sO[1][d]+sO[2][d]+sO[3][d];
+        O[((int64_t)req*num_heads_q + hq)*HEAD_DIM + d] = __float2bfloat16(o*inv);
+    }
+    if (warp==0 && lane==0 && LSE != nullptr)
+        LSE[(int64_t)req*num_heads_q + hq] = (denom>0.f)?(gmax+logf(denom)):-INFINITY;
+}
+
+// ===========================================================================
 // MERGE KERNEL — flash-decoding LSE merge across split-K chunks.
 //   grid = (num_requests, Hq).  block = HEAD_DIM threads (128).
 //   For q-head hq (kv-head hkv=hq/GQA, local g=hq%GQA), read all chunks'
@@ -1986,6 +2066,509 @@ sm120_fmha_decode_partial_p128_ldsm(
     }
 }
 
+// ===========================================================================
+// PAGE-128 LDMATRIX PARTIAL, SHARED-KV-BUFFER  (W4=4 — occupancy lever)
+//
+//   GEOMETRY ROOT-CAUSE (measured, GEOMETRY_TUNING.md): the live partial gap to
+//   Triton is NOT bandwidth, NOT block-skew, NOT inter-kernel overlap. With warm
+//   caches (the live steady-state: the 16 KV pages are L2-resident, DRAM drops to
+//   0.16%) ours runs 12710 cycles vs Triton 11280; the #1 stall is `wait` (35%) —
+//   the MMA/exp fixed-latency pipeline EXPOSED because the SM is smem-capped to
+//   ONE resident block (78.85 KB) so only ~4 warps / 0.93 warps-per-scheduler are
+//   live to hide it. sm__cycles_active = 25% (124 of 188 SMs idle).
+//
+//   THIS KERNEL'S LEVER: collapse sK and sV into ONE shared page buffer. K loads
+//   it, QK consumes it, THEN V loads into the same bytes for PV. Smem drops
+//   78.85 KB -> ~43 KB => Block-Limit-Shared-Mem = 2 => 2 resident blocks/SM =>
+//   ~2x warps/scheduler to hide the `wait` stall. Cost: K-load and V-load no
+//   longer overlap (V waits for QK to free the buffer), but at the bs1 hot config
+//   (split_chunks=16 => exactly ONE page/block, no inner loop) there was no
+//   next-page overlap to lose anyway, and V is L2-resident so its load is cheap.
+//   Numerics identical to the _ldsm kernel (bf16 QK, bf16 PV, fp32 accum).
+// ===========================================================================
+extern "C" __global__ void __launch_bounds__(NUM_WARPS * 32)
+sm120_fmha_decode_partial_p128_ldsm2(
+    const __nv_bfloat16 * __restrict__ Q,     // [R, Hq, 128]
+    const __nv_bfloat16 * __restrict__ Kc,    // [num_pages, 128, Hkv, 128]
+    const __nv_bfloat16 * __restrict__ Vc,    // [num_pages, 128, Hkv, 128]
+    __nv_bfloat16 * __restrict__ O_part,      // [R, Hkv, GQA, C, 128] bf16
+    float * __restrict__ M_part,              // [R, Hkv, GQA, C]
+    float * __restrict__ L_part,              // [R, Hkv, GQA, C]
+    const int * __restrict__ block_ids,
+    const int * __restrict__ block_table,
+    int max_logical_blocks,
+    int topk,
+    int seq_len_k,
+    int num_heads_q,
+    int num_heads_kv,
+    float softmax_scale,
+    int split_chunks,
+    int pages_per_chunk)
+{
+    extern __shared__ __nv_bfloat16 smem_raw[];
+
+    const int tid = threadIdx.x;
+    const int wid = tid / 32;
+    const int lid = tid % 32;
+    const int grp = lid / 4;
+    const int sub = lid % 4;
+    const int nthr = NUM_WARPS * 32;
+    const int ldlane = lid % 16;
+    const int ldhalf = lid / 16;
+
+    const int hkv   = blockIdx.x;
+    const int chunk = blockIdx.y;
+    const int req   = blockIdx.z;
+
+    const int qstride     = num_heads_q  * HEAD_DIM;
+    const int kvstride    = num_heads_kv * HEAD_DIM;
+    const int page_stride = P128_N * num_heads_kv * HEAD_DIM;
+
+    const int hq0 = hkv * GQA;
+    const __nv_bfloat16 *Qp    = Q + (int64_t)req * qstride + hq0 * HEAD_DIM;
+    const __nv_bfloat16 *Kbase = Kc + hkv * HEAD_DIM;
+    const __nv_bfloat16 *Vbase = Vc + hkv * HEAD_DIM;
+    const int *bt_row  = block_table + req * max_logical_blocks;
+    const int *blk_row = block_ids   + req * topk;
+
+    // SMEM (one shared KV page buffer): sQ[16xKVLD] + sKV[128xKVLD] +
+    //   sPbf[16xPLD] + sRed.  ~43 KB => 2 blocks/SM.
+    __nv_bfloat16 *sQ  = smem_raw;
+    __nv_bfloat16 *sKV = sQ + GQA   * LDSM_KVLD;
+    __nv_bfloat16 *sPbf= sKV + P128_N* LDSM_KVLD;
+    float *sRed        = reinterpret_cast<float*>(sPbf + GQA * LDSM_PLD);
+
+    {   // Q load.
+        const int total = GQA * HEAD_DIM;
+        for (int e = tid * 8; e < total; e += nthr * 8)
+            cp_async_16b(sQ + (e / HEAD_DIM) * LDSM_KVLD + (e % HEAD_DIM), Qp + e);
+        cp_async_commit();
+    }
+
+    const int key0 = wid * 32;
+    const int dbase= wid * 32;
+
+    float Oa[4][4];
+    #pragma unroll
+    for (int i = 0; i < 4; i++) Oa[i][0]=Oa[i][1]=Oa[i][2]=Oa[i][3]=0.f;
+    float rm[2] = {-INFINITY, -INFINITY};
+    float rl[2] = {0.f, 0.f};
+    constexpr float LG2E = 1.4426950408889634f;
+
+    const int p_begin = chunk * pages_per_chunk;
+    const int p_end   = min(p_begin + pages_per_chunk, topk);
+
+    auto page_meta = [&](int t, int &kvv, const __nv_bfloat16* &Kpage,
+                         const __nv_bfloat16* &Vpage) -> bool {
+        int kb = (t >= p_begin && t < p_end) ? blk_row[t] : -1;
+        if (kb < 0) return false;
+        int kvs = kb * P128_N;
+        if (kvs >= seq_len_k) return false;
+        kvv = min(P128_N, seq_len_k - kvs);
+        int page = bt_row[kb];
+        Kpage = Kbase + (int64_t)page * page_stride;
+        Vpage = Vbase + (int64_t)page * page_stride;
+        return true;
+    };
+
+    for (int t = p_begin; t < p_end; t++) {
+        int kvv = 0; const __nv_bfloat16 *Kp=nullptr,*Vp=nullptr;
+        bool valid = page_meta(t, kvv, Kp, Vp);
+
+        // ---- load K into the shared buffer ----
+        if (valid) load_page128_async_pad(sKV, Kp, kvv, kvstride, tid, nthr);
+        else { for (int e = tid*8; e < P128_N*HEAD_DIM; e += nthr*8) {
+                   int row=e/HEAD_DIM, col=e%HEAD_DIM;
+                   *reinterpret_cast<uint4*>(sKV+row*LDSM_KVLD+col)=make_uint4(0,0,0,0);} }
+        cp_async_commit();
+        cp_async_wait0();
+        __syncthreads();
+
+        // ---- QK: this warp's 32 keys [key0,key0+32) -> 4 n-tiles ----
+        float Sr[4][4];
+        #pragma unroll
+        for (int i = 0; i < 4; i++) Sr[i][0]=Sr[i][1]=Sr[i][2]=Sr[i][3]=0.f;
+        #pragma unroll
+        for (int ks = 0; ks < 8; ks++) {
+            const int koff = ks * MMA_K_BF16;
+            uint32_t qa0,qa1,qa2,qa3;
+            ldmatrix_x4(qa0,qa1,qa2,qa3,
+                cvta_shared(&sQ[ldlane*LDSM_KVLD + koff + ldhalf*8]));
+            uint32_t ka0,ka1,ka2,ka3, kb0,kb1,kb2,kb3;
+            ldmatrix_x4(ka0,ka1,ka2,ka3,
+                cvta_shared(&sKV[(key0 + ldlane)*LDSM_KVLD + koff + ldhalf*8]));
+            ldmatrix_x4(kb0,kb1,kb2,kb3,
+                cvta_shared(&sKV[(key0 + 16 + ldlane)*LDSM_KVLD + koff + ldhalf*8]));
+            hmma_bf16_m16n8k16(Sr[0][0],Sr[0][1],Sr[0][2],Sr[0][3], qa0,qa1,qa2,qa3, ka0,ka2, Sr[0][0],Sr[0][1],Sr[0][2],Sr[0][3]);
+            hmma_bf16_m16n8k16(Sr[1][0],Sr[1][1],Sr[1][2],Sr[1][3], qa0,qa1,qa2,qa3, ka1,ka3, Sr[1][0],Sr[1][1],Sr[1][2],Sr[1][3]);
+            hmma_bf16_m16n8k16(Sr[2][0],Sr[2][1],Sr[2][2],Sr[2][3], qa0,qa1,qa2,qa3, kb0,kb2, Sr[2][0],Sr[2][1],Sr[2][2],Sr[2][3]);
+            hmma_bf16_m16n8k16(Sr[3][0],Sr[3][1],Sr[3][2],Sr[3][3], qa0,qa1,qa2,qa3, kb1,kb3, Sr[3][0],Sr[3][1],Sr[3][2],Sr[3][3]);
+        }
+        #pragma unroll
+        for (int i = 0; i < 4; i++) {
+            Sr[i][0]*=softmax_scale; Sr[i][1]*=softmax_scale;
+            Sr[i][2]*=softmax_scale; Sr[i][3]*=softmax_scale;
+        }
+        if (kvv < P128_N) {
+            #pragma unroll
+            for (int nt = 0; nt < 4; nt++) {
+                int n0 = key0 + nt*MMA_N + sub*2, n1 = n0+1;
+                if (n0 >= kvv) { Sr[nt][0]=-INFINITY; Sr[nt][2]=-INFINITY; }
+                if (n1 >= kvv) { Sr[nt][1]=-INFINITY; Sr[nt][3]=-INFINITY; }
+            }
+        }
+        // ---- per-warp partial row-max, then cross-warp ----
+        float mx0=-INFINITY, mx1=-INFINITY;
+        #pragma unroll
+        for (int i = 0; i < 4; i++) {
+            mx0=fmaxf(mx0,fmaxf(Sr[i][0],Sr[i][1]));
+            mx1=fmaxf(mx1,fmaxf(Sr[i][2],Sr[i][3]));
+        }
+        { float tt;
+          tt=__shfl_xor_sync(0xffffffff,mx0,1); mx0=fmaxf(mx0,tt);
+          tt=__shfl_xor_sync(0xffffffff,mx0,2); mx0=fmaxf(mx0,tt);
+          tt=__shfl_xor_sync(0xffffffff,mx1,1); mx1=fmaxf(mx1,tt);
+          tt=__shfl_xor_sync(0xffffffff,mx1,2); mx1=fmaxf(mx1,tt); }
+        if (sub == 0) { sRed[(wid*GQA + grp)*2 + 0] = mx0; sRed[(wid*GQA + grp + 8)*2 + 0] = mx1; }
+        __syncthreads();
+        float pmx0 = mx0, pmx1 = mx1;
+        #pragma unroll
+        for (int w = 0; w < NUM_WARPS; w++) {
+            pmx0 = fmaxf(pmx0, sRed[(w*GQA + grp)*2 + 0]);
+            pmx1 = fmaxf(pmx1, sRed[(w*GQA + grp + 8)*2 + 0]);
+        }
+        float mn0=fmaxf(rm[0],pmx0), mn1=fmaxf(rm[1],pmx1);
+        float s0=(rm[0]==-INFINITY)?0.f:exp2f(LG2E*(rm[0]-mn0));
+        float s1=(rm[1]==-INFINITY)?0.f:exp2f(LG2E*(rm[1]-mn1));
+        rl[0]*=s0; rl[1]*=s1;
+        #pragma unroll
+        for (int d=0;d<4;d++){ Oa[d][0]*=s0;Oa[d][1]*=s0;Oa[d][2]*=s1;Oa[d][3]*=s1; }
+        const bool dead0=(mn0==-INFINITY), dead1=(mn1==-INFINITY);
+        float ls0=0.f, ls1=0.f;
+        #pragma unroll
+        for (int i=0;i<4;i++){
+            Sr[i][0]=dead0?0.f:exp2f(LG2E*(Sr[i][0]-mn0));
+            Sr[i][1]=dead0?0.f:exp2f(LG2E*(Sr[i][1]-mn0));
+            Sr[i][2]=dead1?0.f:exp2f(LG2E*(Sr[i][2]-mn1));
+            Sr[i][3]=dead1?0.f:exp2f(LG2E*(Sr[i][3]-mn1));
+            ls0+=Sr[i][0]+Sr[i][1]; ls1+=Sr[i][2]+Sr[i][3];
+        }
+        { float tt;
+          tt=__shfl_xor_sync(0xffffffff,ls0,1); ls0+=tt;
+          tt=__shfl_xor_sync(0xffffffff,ls0,2); ls0+=tt;
+          tt=__shfl_xor_sync(0xffffffff,ls1,1); ls1+=tt;
+          tt=__shfl_xor_sync(0xffffffff,ls1,2); ls1+=tt; }
+        if (sub == 0) { sRed[(wid*GQA + grp)*2 + 1] = ls0; sRed[(wid*GQA + grp + 8)*2 + 1] = ls1; }
+        // ---- write P-bf16 into sPbf ----
+        #pragma unroll
+        for (int nt=0;nt<4;nt++){
+            int kv_col = key0 + nt*MMA_N + sub*2;
+            sPbf[grp*LDSM_PLD + kv_col]         = __float2bfloat16(Sr[nt][0]);
+            sPbf[grp*LDSM_PLD + kv_col + 1]     = __float2bfloat16(Sr[nt][1]);
+            sPbf[(grp+8)*LDSM_PLD + kv_col]     = __float2bfloat16(Sr[nt][2]);
+            sPbf[(grp+8)*LDSM_PLD + kv_col + 1] = __float2bfloat16(Sr[nt][3]);
+        }
+        __syncthreads();   // P landed; ALSO: K fully consumed -> sKV free for V.
+        float gl0=0.f, gl1=0.f;
+        #pragma unroll
+        for (int w=0; w<NUM_WARPS; w++){
+            gl0 += sRed[(w*GQA + grp)*2 + 1];
+            gl1 += sRed[(w*GQA + grp + 8)*2 + 1];
+        }
+        rm[0]=mn0; rm[1]=mn1; rl[0]+=gl0; rl[1]+=gl1;
+
+        // ---- load V into the SAME shared buffer (K no longer needed) ----
+        if (valid) load_page128_async_pad(sKV, Vp, kvv, kvstride, tid, nthr);
+        else { for (int e = tid*8; e < P128_N*HEAD_DIM; e += nthr*8) {
+                   int row=e/HEAD_DIM, col=e%HEAD_DIM;
+                   *reinterpret_cast<uint4*>(sKV+row*LDSM_KVLD+col)=make_uint4(0,0,0,0);} }
+        cp_async_commit();
+        cp_async_wait0();
+        __syncthreads();
+
+        // ---- PV (bf16 HMMA) ----
+        #pragma unroll
+        for (int ks = 0; ks < 8; ks++) {
+            const int koff = ks * MMA_K_BF16;
+            uint32_t pa0,pa1,pa2,pa3;
+            ldmatrix_x4(pa0,pa1,pa2,pa3,
+                cvta_shared(&sPbf[ldlane*LDSM_PLD + koff + ldhalf*8]));
+            uint32_t va0,va1,va2,va3;
+            ldmatrix_x4_trans(va0,va1,va2,va3,
+                cvta_shared(&sKV[(koff + ldlane)*LDSM_KVLD + dbase + ldhalf*8]));
+            uint32_t vb0,vb1,vb2,vb3;
+            ldmatrix_x4_trans(vb0,vb1,vb2,vb3,
+                cvta_shared(&sKV[(koff + ldlane)*LDSM_KVLD + dbase + 16 + ldhalf*8]));
+            hmma_bf16_m16n8k16(Oa[0][0],Oa[0][1],Oa[0][2],Oa[0][3], pa0,pa1,pa2,pa3, va0,va1, Oa[0][0],Oa[0][1],Oa[0][2],Oa[0][3]);
+            hmma_bf16_m16n8k16(Oa[1][0],Oa[1][1],Oa[1][2],Oa[1][3], pa0,pa1,pa2,pa3, va2,va3, Oa[1][0],Oa[1][1],Oa[1][2],Oa[1][3]);
+            hmma_bf16_m16n8k16(Oa[2][0],Oa[2][1],Oa[2][2],Oa[2][3], pa0,pa1,pa2,pa3, vb0,vb1, Oa[2][0],Oa[2][1],Oa[2][2],Oa[2][3]);
+            hmma_bf16_m16n8k16(Oa[3][0],Oa[3][1],Oa[3][2],Oa[3][3], pa0,pa1,pa2,pa3, vb2,vb3, Oa[3][0],Oa[3][1],Oa[3][2],Oa[3][3]);
+        }
+        __syncthreads();   // protect sKV/sPbf/sRed reuse next page.
+    }
+
+    // ===== epilogue =====
+    const int64_t head_base = ((int64_t)req * num_heads_kv + hkv) * GQA;
+    const int r0 = grp, r1 = grp + 8;
+    #pragma unroll
+    for (int dt=0; dt<4; dt++){
+        int c0 = dbase + dt*MMA_N + sub*2, c1 = c0+1;
+        int64_t ob0 = ((head_base + r0) * split_chunks + chunk) * HEAD_DIM;
+        int64_t ob1 = ((head_base + r1) * split_chunks + chunk) * HEAD_DIM;
+        O_part[ob0 + c0]=__float2bfloat16(Oa[dt][0]); O_part[ob0 + c1]=__float2bfloat16(Oa[dt][1]);
+        O_part[ob1 + c0]=__float2bfloat16(Oa[dt][2]); O_part[ob1 + c1]=__float2bfloat16(Oa[dt][3]);
+    }
+    if (wid == 0 && sub == 0) {
+        M_part[(head_base + r0) * split_chunks + chunk] = rm[0];
+        M_part[(head_base + r1) * split_chunks + chunk] = rm[1];
+        L_part[(head_base + r0) * split_chunks + chunk] = rl[0];
+        L_part[(head_base + r1) * split_chunks + chunk] = rl[1];
+    }
+}
+
+// ===========================================================================
+// PAGE-128 LDMATRIX PARTIAL, KEY-SPLIT-K  (W4=5 — geometry lever)
+//
+//   GEOMETRY MEASUREMENT (GEOMETRY_TUNING.md): the R-scaling proved the GPU
+//   swallows 128 blocks nearly free at bs1 (64->128 blocks = total 6.67->6.84us,
+//   per-request HALVES) because 124 of 188 SMs sit idle. The non-redundant way to
+//   reach 128 blocks at bs1 WITHOUT wasting MMA (head-split would force M=8) is to
+//   KEY-split each 128-page across 2 blocks: each block does QK+PV over its 64-key
+//   half with FULL M=16 (half the MMA/block, half the cross-warp-softmax span =
+//   16 keys/warp not 32), writing a separate chunk slot. Cost: the merge reduces
+//   2x the chunks. This is the page-64 split-K geometry but on the ldmatrix feed.
+//
+//   Implemented as a thin shell over the single-page math: each block owns ONE
+//   (page, half) = 64 keys. 4 warps split the 64 keys -> 16 keys/warp -> 2 n-tiles
+//   each. khalf selects keys [khalf*64, khalf*64+64). PV is over 64 keys (4 k16).
+//   Numerics: exact same online-softmax as _ldsm2; chunk = page*2 + khalf.
+// ===========================================================================
+extern "C" __global__ void __launch_bounds__(NUM_WARPS * 32)
+sm120_fmha_decode_partial_p128_ksplit(
+    const __nv_bfloat16 * __restrict__ Q,
+    const __nv_bfloat16 * __restrict__ Kc,
+    const __nv_bfloat16 * __restrict__ Vc,
+    __nv_bfloat16 * __restrict__ O_part,
+    float * __restrict__ M_part,
+    float * __restrict__ L_part,
+    const int * __restrict__ block_ids,
+    const int * __restrict__ block_table,
+    int max_logical_blocks,
+    int topk,
+    int seq_len_k,
+    int num_heads_q,
+    int num_heads_kv,
+    float softmax_scale,
+    int split_chunks,         // = 2 * (#page-chunks); here = 2*topk
+    int pages_per_chunk)      // pages per HALF-chunk; bs1 hot path = 1
+{
+    extern __shared__ __nv_bfloat16 smem_raw[];
+    constexpr int KN = 64;                    // keys this block processes
+
+    const int tid = threadIdx.x;
+    const int wid = tid / 32;                 // 0..3 : 16 keys/warp
+    const int lid = tid % 32;
+    const int grp = lid / 4;
+    const int sub = lid % 4;
+    const int nthr = NUM_WARPS * 32;
+    const int ldlane = lid % 16;
+    const int ldhalf = lid / 16;
+
+    const int hkv   = blockIdx.x;
+    const int hchunk= blockIdx.y;             // half-chunk index (0..2*topk-1)
+    const int req   = blockIdx.z;
+    const int khalf = hchunk & 1;             // which 64-key half of the page
+    const int pchunk= hchunk >> 1;            // page-chunk index
+
+    const int qstride     = num_heads_q  * HEAD_DIM;
+    const int kvstride    = num_heads_kv * HEAD_DIM;
+    const int page_stride = P128_N * num_heads_kv * HEAD_DIM;
+
+    const int hq0 = hkv * GQA;
+    const __nv_bfloat16 *Qp    = Q + (int64_t)req * qstride + hq0 * HEAD_DIM;
+    const __nv_bfloat16 *Kbase = Kc + hkv * HEAD_DIM;
+    const __nv_bfloat16 *Vbase = Vc + hkv * HEAD_DIM;
+    const int *bt_row  = block_table + req * max_logical_blocks;
+    const int *blk_row = block_ids   + req * topk;
+
+    // SMEM: sQ[16xKVLD] + sKV[64xKVLD] + sPbf[16x(64+8)] + sRed.  ~27 KB.
+    const int KVLD = LDSM_KVLD;
+    __nv_bfloat16 *sQ  = smem_raw;
+    __nv_bfloat16 *sKV = sQ + GQA * KVLD;
+    __nv_bfloat16 *sPbf= sKV + KN * KVLD;                 // 16 x (KN+8)
+    const int KPLD = KN + 8;
+    float *sRed        = reinterpret_cast<float*>(sPbf + GQA * KPLD);
+
+    {   const int total = GQA * HEAD_DIM;
+        for (int e = tid * 8; e < total; e += nthr * 8)
+            cp_async_16b(sQ + (e / HEAD_DIM) * KVLD + (e % HEAD_DIM), Qp + e);
+        cp_async_commit();
+    }
+
+    const int key0 = wid * 16;                // this warp's first key (of 64)
+    const int dbase= wid * 32;
+
+    float Oa[4][4];
+    #pragma unroll
+    for (int i = 0; i < 4; i++) Oa[i][0]=Oa[i][1]=Oa[i][2]=Oa[i][3]=0.f;
+    float rm[2] = {-INFINITY, -INFINITY};
+    float rl[2] = {0.f, 0.f};
+    constexpr float LG2E = 1.4426950408889634f;
+
+    const int p_begin = pchunk * pages_per_chunk;
+    const int p_end   = min(p_begin + pages_per_chunk, topk);
+
+    // load one 64-key half of a page into sKV[64 x KVLD] from gmem rows [base..+64)
+    auto load_half = [&](const __nv_bfloat16 *gpage, int kvv_in_half) {
+        for (int e = tid*8; e < KN*HEAD_DIM; e += nthr*8) {
+            int row = e/HEAD_DIM, col = e%HEAD_DIM;
+            __nv_bfloat16 *dst = sKV + row*KVLD + col;
+            if (row < kvv_in_half) cp_async_16b(dst, gpage + (int64_t)row*kvstride + col);
+            else *reinterpret_cast<uint4*>(dst) = make_uint4(0,0,0,0);
+        }
+    };
+
+    for (int t = p_begin; t < p_end; t++) {
+        int kb = blk_row[t];
+        int kvs = (kb >= 0) ? kb * P128_N : seq_len_k;
+        int page = (kb >= 0) ? bt_row[kb] : -1;
+        int row_base = khalf * KN;                          // first key within page
+        int kvv = 0;                                        // valid keys in THIS half
+        const __nv_bfloat16 *Kpage=nullptr,*Vpage=nullptr;
+        bool valid = (kb >= 0) && (kvs < seq_len_k);
+        if (valid) {
+            int page_valid = min(P128_N, seq_len_k - kvs); // valid keys in the page
+            kvv = max(0, min(KN, page_valid - row_base));
+            Kpage = Kbase + (int64_t)page*page_stride + (int64_t)row_base*kvstride;
+            Vpage = Vbase + (int64_t)page*page_stride + (int64_t)row_base*kvstride;
+        }
+        if (kvv == 0) valid = false;
+
+        // ---- load K half ----
+        if (valid) load_half(Kpage, kvv);
+        else { for (int e=tid*8;e<KN*HEAD_DIM;e+=nthr*8){int r=e/HEAD_DIM,c=e%HEAD_DIM;
+                   *reinterpret_cast<uint4*>(sKV+r*KVLD+c)=make_uint4(0,0,0,0);} }
+        cp_async_commit(); cp_async_wait0(); __syncthreads();
+
+        // ---- QK: this warp's 16 keys [key0,key0+16) -> 2 n-tiles ----
+        float Sr[2][4];
+        #pragma unroll
+        for (int i=0;i<2;i++) Sr[i][0]=Sr[i][1]=Sr[i][2]=Sr[i][3]=0.f;
+        #pragma unroll
+        for (int ks=0; ks<8; ks++) {
+            const int koff = ks*MMA_K_BF16;
+            uint32_t qa0,qa1,qa2,qa3;
+            ldmatrix_x4(qa0,qa1,qa2,qa3, cvta_shared(&sQ[ldlane*KVLD + koff + ldhalf*8]));
+            uint32_t ka0,ka1,ka2,ka3;
+            ldmatrix_x4(ka0,ka1,ka2,ka3, cvta_shared(&sKV[(key0+ldlane)*KVLD + koff + ldhalf*8]));
+            // n0=keys[key0..7]=(ka0,ka2); n1=keys[key0+8..15]=(ka1,ka3)
+            hmma_bf16_m16n8k16(Sr[0][0],Sr[0][1],Sr[0][2],Sr[0][3], qa0,qa1,qa2,qa3, ka0,ka2, Sr[0][0],Sr[0][1],Sr[0][2],Sr[0][3]);
+            hmma_bf16_m16n8k16(Sr[1][0],Sr[1][1],Sr[1][2],Sr[1][3], qa0,qa1,qa2,qa3, ka1,ka3, Sr[1][0],Sr[1][1],Sr[1][2],Sr[1][3]);
+        }
+        #pragma unroll
+        for (int i=0;i<2;i++){ Sr[i][0]*=softmax_scale;Sr[i][1]*=softmax_scale;Sr[i][2]*=softmax_scale;Sr[i][3]*=softmax_scale; }
+        if (kvv < KN) {
+            #pragma unroll
+            for (int nt=0; nt<2; nt++) {
+                int n0 = key0 + nt*MMA_N + sub*2, n1 = n0+1;
+                if (n0 >= kvv) { Sr[nt][0]=-INFINITY; Sr[nt][2]=-INFINITY; }
+                if (n1 >= kvv) { Sr[nt][1]=-INFINITY; Sr[nt][3]=-INFINITY; }
+            }
+        }
+        // ---- partial row-max over this warp's 16 keys, then cross-warp ----
+        float mx0=-INFINITY, mx1=-INFINITY;
+        #pragma unroll
+        for (int i=0;i<2;i++){ mx0=fmaxf(mx0,fmaxf(Sr[i][0],Sr[i][1])); mx1=fmaxf(mx1,fmaxf(Sr[i][2],Sr[i][3])); }
+        { float tt;
+          tt=__shfl_xor_sync(0xffffffff,mx0,1); mx0=fmaxf(mx0,tt);
+          tt=__shfl_xor_sync(0xffffffff,mx0,2); mx0=fmaxf(mx0,tt);
+          tt=__shfl_xor_sync(0xffffffff,mx1,1); mx1=fmaxf(mx1,tt);
+          tt=__shfl_xor_sync(0xffffffff,mx1,2); mx1=fmaxf(mx1,tt); }
+        if (sub==0){ sRed[(wid*GQA+grp)*2+0]=mx0; sRed[(wid*GQA+grp+8)*2+0]=mx1; }
+        __syncthreads();
+        float pmx0=mx0, pmx1=mx1;
+        #pragma unroll
+        for (int w=0;w<NUM_WARPS;w++){ pmx0=fmaxf(pmx0,sRed[(w*GQA+grp)*2+0]); pmx1=fmaxf(pmx1,sRed[(w*GQA+grp+8)*2+0]); }
+        float mn0=fmaxf(rm[0],pmx0), mn1=fmaxf(rm[1],pmx1);
+        float s0=(rm[0]==-INFINITY)?0.f:exp2f(LG2E*(rm[0]-mn0));
+        float s1=(rm[1]==-INFINITY)?0.f:exp2f(LG2E*(rm[1]-mn1));
+        rl[0]*=s0; rl[1]*=s1;
+        #pragma unroll
+        for (int d=0;d<4;d++){ Oa[d][0]*=s0;Oa[d][1]*=s0;Oa[d][2]*=s1;Oa[d][3]*=s1; }
+        const bool dead0=(mn0==-INFINITY), dead1=(mn1==-INFINITY);
+        float ls0=0.f, ls1=0.f;
+        #pragma unroll
+        for (int i=0;i<2;i++){
+            Sr[i][0]=dead0?0.f:exp2f(LG2E*(Sr[i][0]-mn0));
+            Sr[i][1]=dead0?0.f:exp2f(LG2E*(Sr[i][1]-mn0));
+            Sr[i][2]=dead1?0.f:exp2f(LG2E*(Sr[i][2]-mn1));
+            Sr[i][3]=dead1?0.f:exp2f(LG2E*(Sr[i][3]-mn1));
+            ls0+=Sr[i][0]+Sr[i][1]; ls1+=Sr[i][2]+Sr[i][3];
+        }
+        { float tt;
+          tt=__shfl_xor_sync(0xffffffff,ls0,1); ls0+=tt;
+          tt=__shfl_xor_sync(0xffffffff,ls0,2); ls0+=tt;
+          tt=__shfl_xor_sync(0xffffffff,ls1,1); ls1+=tt;
+          tt=__shfl_xor_sync(0xffffffff,ls1,2); ls1+=tt; }
+        if (sub==0){ sRed[(wid*GQA+grp)*2+1]=ls0; sRed[(wid*GQA+grp+8)*2+1]=ls1; }
+        // ---- write P-bf16 into sPbf[16 x 64] (key = key0 + nt*8 + {sub*2,+1}) ----
+        #pragma unroll
+        for (int nt=0;nt<2;nt++){
+            int kv_col = key0 + nt*MMA_N + sub*2;
+            sPbf[grp*KPLD + kv_col]         = __float2bfloat16(Sr[nt][0]);
+            sPbf[grp*KPLD + kv_col + 1]     = __float2bfloat16(Sr[nt][1]);
+            sPbf[(grp+8)*KPLD + kv_col]     = __float2bfloat16(Sr[nt][2]);
+            sPbf[(grp+8)*KPLD + kv_col + 1] = __float2bfloat16(Sr[nt][3]);
+        }
+        __syncthreads();
+        float gl0=0.f, gl1=0.f;
+        #pragma unroll
+        for (int w=0;w<NUM_WARPS;w++){ gl0+=sRed[(w*GQA+grp)*2+1]; gl1+=sRed[(w*GQA+grp+8)*2+1]; }
+        rm[0]=mn0; rm[1]=mn1; rl[0]+=gl0; rl[1]+=gl1;
+
+        // ---- load V half into the same buffer ----
+        if (valid) load_half(Vpage, kvv);
+        else { for (int e=tid*8;e<KN*HEAD_DIM;e+=nthr*8){int r=e/HEAD_DIM,c=e%HEAD_DIM;
+                   *reinterpret_cast<uint4*>(sKV+r*KVLD+c)=make_uint4(0,0,0,0);} }
+        cp_async_commit(); cp_async_wait0(); __syncthreads();
+
+        // ---- PV over 64 keys (4 k16-steps) ----
+        #pragma unroll
+        for (int ks=0; ks<4; ks++) {
+            const int koff = ks*MMA_K_BF16;
+            uint32_t pa0,pa1,pa2,pa3;
+            ldmatrix_x4(pa0,pa1,pa2,pa3, cvta_shared(&sPbf[ldlane*KPLD + koff + ldhalf*8]));
+            uint32_t va0,va1,va2,va3;
+            ldmatrix_x4_trans(va0,va1,va2,va3, cvta_shared(&sKV[(koff+ldlane)*KVLD + dbase + ldhalf*8]));
+            uint32_t vb0,vb1,vb2,vb3;
+            ldmatrix_x4_trans(vb0,vb1,vb2,vb3, cvta_shared(&sKV[(koff+ldlane)*KVLD + dbase + 16 + ldhalf*8]));
+            hmma_bf16_m16n8k16(Oa[0][0],Oa[0][1],Oa[0][2],Oa[0][3], pa0,pa1,pa2,pa3, va0,va1, Oa[0][0],Oa[0][1],Oa[0][2],Oa[0][3]);
+            hmma_bf16_m16n8k16(Oa[1][0],Oa[1][1],Oa[1][2],Oa[1][3], pa0,pa1,pa2,pa3, va2,va3, Oa[1][0],Oa[1][1],Oa[1][2],Oa[1][3]);
+            hmma_bf16_m16n8k16(Oa[2][0],Oa[2][1],Oa[2][2],Oa[2][3], pa0,pa1,pa2,pa3, vb0,vb1, Oa[2][0],Oa[2][1],Oa[2][2],Oa[2][3]);
+            hmma_bf16_m16n8k16(Oa[3][0],Oa[3][1],Oa[3][2],Oa[3][3], pa0,pa1,pa2,pa3, vb2,vb3, Oa[3][0],Oa[3][1],Oa[3][2],Oa[3][3]);
+        }
+        __syncthreads();
+    }
+
+    // ===== epilogue: chunk slot = hchunk (= page*2 + khalf) =====
+    const int64_t head_base = ((int64_t)req * num_heads_kv + hkv) * GQA;
+    const int r0 = grp, r1 = grp + 8;
+    #pragma unroll
+    for (int dt=0; dt<4; dt++){
+        int c0 = dbase + dt*MMA_N + sub*2, c1 = c0+1;
+        int64_t ob0 = ((head_base + r0) * split_chunks + hchunk) * HEAD_DIM;
+        int64_t ob1 = ((head_base + r1) * split_chunks + hchunk) * HEAD_DIM;
+        O_part[ob0 + c0]=__float2bfloat16(Oa[dt][0]); O_part[ob0 + c1]=__float2bfloat16(Oa[dt][1]);
+        O_part[ob1 + c0]=__float2bfloat16(Oa[dt][2]); O_part[ob1 + c1]=__float2bfloat16(Oa[dt][3]);
+    }
+    if (wid == 0 && sub == 0) {
+        M_part[(head_base + r0) * split_chunks + hchunk] = rm[0];
+        M_part[(head_base + r1) * split_chunks + hchunk] = rm[1];
+        L_part[(head_base + r0) * split_chunks + hchunk] = rl[0];
+        L_part[(head_base + r1) * split_chunks + hchunk] = rl[1];
+    }
+}
+
 // ============================ torch binding ============================
 #include <torch/extension.h>
 #include <ATen/cuda/CUDAContext.h>
@@ -2186,6 +2769,53 @@ std::vector<torch::Tensor> forward_sparse_decode_p128_bf16(
             block_ids.data_ptr<int>(), block_table.data_ptr<int>(),
             max_logical_blocks, topk, seq_k, Hq, Hkv, (float)softmax_scale,
             split_chunks, pages_per_chunk);
+    } else if (use_4warp == 5) {
+        // LDMATRIX path, KEY-SPLIT-K: split each 128-page into 2x 64-key half-
+        // chunks across 2 blocks => 2*topk chunks => grid (Hkv, 2*topk, R) = 128
+        // blocks at bs1 (fills idle SMs; see GEOMETRY_TUNING.md). M=16 preserved,
+        // half the MMA + half the cross-warp-softmax span per block. Merge reduces
+        // 2*topk chunks. split_chunks/pages_per_chunk forced to the half-chunk grid.
+        int hchunks = 2 * topk;                  // one half-chunk per (page, half)
+        split_chunks = hchunks;
+        pages_per_chunk = 1;
+        // re-alloc O/M/L for the doubled chunk count
+        O_part = torch::empty({R, Hkv, GQA, split_chunks, HEAD_DIM}, bopt);
+        M_part = torch::empty({R, Hkv, GQA, split_chunks}, fopt);
+        L_part = torch::empty({R, Hkv, GQA, split_chunks}, fopt);
+        dim3 grid_p(Hkv, hchunks, R);
+        const int KVLD = HEAD_DIM + 8, KPLD = 64 + 8;
+        int smem_bytes = (GQA*KVLD + 64*KVLD + GQA*KPLD) * (int)sizeof(__nv_bfloat16)
+                       + NUM_WARPS * GQA * 2 * (int)sizeof(float);
+        cudaFuncSetAttribute(sm120_fmha_decode_partial_p128_ksplit,
+            cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes);
+        sm120_fmha_decode_partial_p128_ksplit<<<grid_p, block_p, smem_bytes, stream>>>(
+            reinterpret_cast<const __nv_bfloat16*>(q.data_ptr()),
+            reinterpret_cast<const __nv_bfloat16*>(k_cache.data_ptr()),
+            reinterpret_cast<const __nv_bfloat16*>(v_cache.data_ptr()),
+            reinterpret_cast<__nv_bfloat16*>(O_part.data_ptr()),
+            M_part.data_ptr<float>(), L_part.data_ptr<float>(),
+            block_ids.data_ptr<int>(), block_table.data_ptr<int>(),
+            max_logical_blocks, topk, seq_k, Hq, Hkv, (float)softmax_scale,
+            split_chunks, pages_per_chunk);
+    } else if (use_4warp == 4) {
+        // LDMATRIX path, SHARED KV BUFFER: K and V share one page buffer so smem
+        // drops 78.85->~43 KB => 2 resident blocks/SM (occupancy lever; see
+        // GEOMETRY_TUNING.md). Same numerics as W4=3.
+        dim3 grid_p(Hkv, split_chunks, R);
+        const int KVLD = HEAD_DIM + 8, PLD = P128_N + 8;
+        int smem_bytes = (GQA*KVLD + P128_N*KVLD + GQA*PLD) * (int)sizeof(__nv_bfloat16)
+                       + NUM_WARPS * GQA * 2 * (int)sizeof(float);
+        cudaFuncSetAttribute(sm120_fmha_decode_partial_p128_ldsm2,
+            cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes);
+        sm120_fmha_decode_partial_p128_ldsm2<<<grid_p, block_p, smem_bytes, stream>>>(
+            reinterpret_cast<const __nv_bfloat16*>(q.data_ptr()),
+            reinterpret_cast<const __nv_bfloat16*>(k_cache.data_ptr()),
+            reinterpret_cast<const __nv_bfloat16*>(v_cache.data_ptr()),
+            reinterpret_cast<__nv_bfloat16*>(O_part.data_ptr()),
+            M_part.data_ptr<float>(), L_part.data_ptr<float>(),
+            block_ids.data_ptr<int>(), block_table.data_ptr<int>(),
+            max_logical_blocks, topk, seq_k, Hq, Hkv, (float)softmax_scale,
+            split_chunks, pages_per_chunk);
     } else if (use_4warp) {
         dim3 grid_p(Hkv, split_chunks, R);
         // sQ + sK + sV + sP(16x128) + sRed(NUM_WARPS*16*2 f32)
@@ -2226,6 +2856,21 @@ std::vector<torch::Tensor> forward_sparse_decode_p128_bf16(
         dim3 grid_m(R, (Hq + HQPB - 1) / HQPB, 1);
         dim3 block_m(HQPB * (HEAD_DIM / 2));
         sm120_fmha_decode_merge_bf16_v2<<<grid_m, block_m, 0, stream>>>(
+            reinterpret_cast<const __nv_bfloat16*>(O_part.data_ptr()),
+            M_part.data_ptr<float>(), L_part.data_ptr<float>(),
+            reinterpret_cast<__nv_bfloat16*>(o.data_ptr()), lse.data_ptr<float>(),
+            split_chunks, Hq, Hkv);
+        return {o, lse};
+    }
+    // MERGE_PAR: chunk-parallel merge (4 warps split the chunk reduction). Auto-ON
+    // for the key-split path (W4=5, 2*topk chunks) where the flat merge is
+    // long-scoreboard bound on the deep O-load chain; opt-in elsewhere.
+    const char *mp = getenv("MERGE_PAR");
+    int merge_par = mp ? atoi(mp) : (use_4warp == 5 ? 1 : 0);
+    if (merge_par) {
+        dim3 grid_m(R, Hq, 1);
+        dim3 block_m(128);
+        sm120_fmha_decode_merge_bf16_par<<<grid_m, block_m, 0, stream>>>(
             reinterpret_cast<const __nv_bfloat16*>(O_part.data_ptr()),
             M_part.data_ptr<float>(), L_part.data_ptr<float>(),
             reinterpret_cast<__nv_bfloat16*>(o.data_ptr()), lse.data_ptr<float>(),
