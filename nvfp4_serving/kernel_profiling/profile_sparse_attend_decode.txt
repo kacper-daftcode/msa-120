@@ -1,0 +1,89 @@
+=== device: NVIDIA RTX PRO 6000 Blackwell Server Edition ===
+SMs=188  max_threads_per_sm=1536  regs_per_sm=65536  smem_per_sm=102400
+
+===== OURS forward_sparse_paged (page-64) =====
+    178.85us/call  ( 99.0%)  x50    sm120_fmha_sparse_paged_bf16
+      0.88us/call  (  0.5%)  x50    void at::native::vectorized_elementwise_kernel<4, at::native::FillFunc
+      0.87us/call  (  0.5%)  x50    void at::native::vectorized_elementwise_kernel<4, at::native::FillFunc
+  -- total CUDA 180.60us/call --
+
+===== TRITON minimax_m3_sparse_attn_decode (page-128, split-K) =====
+      3.96us/call  ( 69.1%)  x50    _gqa_sparse_decode_kernel
+      1.77us/call  ( 30.9%)  x50    _merge_topk_attn_out_kernel
+  -- total CUDA 5.74us/call --
+
+===== OCCUPANCY / LAUNCH GEOMETRY =====
+OURS:   grid=(num_m=1, Hq=64) = 64 thread-blocks, 128 thr/blk. SMs=188.
+        -> 64 blocks across 188 SMs = 0.34 blocks/SM (ideal >=1-2 for full occupancy).
+        Each block: 64x128 M-tile but only q_len=1 real query row -> 1/64 = 1.6% useful rows. 16 blocks scanned sequentially per block.
+        Work/block ~ 16 K-blocks x (64x128 QK + softmax + 64x128 PV) with 63/64 query rows masked-dead.
+TRITON: split-K decode -> grid=(total_q*num_topk_chunks, num_kv_heads). parallelizes the 16 selected blocks across chunks + a merge kernel, so the bs1 query's work is spread over many more thread-blocks.
+        Triton block does only the 16-head GQA group per kv-head (BLOCK_SIZE_H=16) -- no 64-row M-tile waste.
+
+================================================================================
+BOTTLENECK ANALYSIS — sparse_attend, DECODE bs1 (our WORST fair head-to-head)
+================================================================================
+
+NUMBERS (kernel-only, torch profiler, median over 50 calls, GPU 0 alongside
+marlin prod container; identical for kv = 4k/16k/64k since only the 16 selected
+blocks are touched):
+
+    ours  sm120_fmha_sparse_paged_bf16 : ~178.9 us  (single kernel)
+    triton _gqa_sparse_decode_kernel   :   3.96 us
+           _merge_topk_attn_out_kernel :   1.77 us
+           triton total                :   5.74 us
+    ---------------------------------------------------------
+    GAP: ours is ~31x SLOWER, kernel-only, in the interactive-critical regime.
+
+THE LIMITER (named, in priority order):
+
+1. OCCUPANCY STARVATION (primary).
+   Our launch grid is (num_m_blocks, num_heads_q). At bs1 decode q_len==1 so
+   num_m_blocks==1  ->  grid = (1, 64) = 64 thread-blocks total.
+   The RTX PRO 6000 has 188 SMs. 64 blocks / 188 SMs = 0.34 blocks/SM:
+   ~66% of the machine (124 of 188 SMs) NEVER receives a block. There is zero
+   tail-quantization headroom — we cannot even fill the GPU once. This alone
+   caps achievable throughput at ~1/3 of the device before any other effect.
+
+2. INTRA-BLOCK QUERY-ROW WASTE (multiplier on top of #1).
+   The kernel is a FlashAttention-2 *prefill* design: BLK_M = 64 query rows per
+   block. At decode there is exactly 1 real query row, so 63/64 = 98.4% of every
+   MMA is computing masked-dead query rows. Each of the 64 blocks still issues
+   the full 16 x (64x128 QK  +  64x128 PV) bf16 HMMA sequence over the selected
+   blocks. So even the 64 SMs that DO get work spend 98% of their MMA issue slots
+   on garbage rows. Effective useful FLOP utilisation ~= 0.34 (occupancy) x 0.016
+   (useful rows) = ~0.5% of peak. That is the 31x.
+
+3. NO SPLIT-K / SEQUENTIAL BLOCK LOOP (why Triton wins the same problem).
+   Triton's decode kernel is flash-DECODING: it splits the 16 selected blocks
+   across NUM_TOPK_CHUNKS thread-blocks (grid folds query-token x chunk x
+   kv-head) and uses BLOCK_SIZE_H = next_pow2(gqa_group_size) = 16 rows — i.e.
+   it tiles the 16-head GQA GROUP, not a 64-row query tile, so there is no dead
+   query row. The selected blocks run in PARALLEL across SMs; a 1.77us merge
+   kernel recombines the partials (flash-decoding LSE merge). Result: the bs1
+   query's work is spread over many SMs with ~100% useful rows -> 5.7us.
+
+   Our kernel has neither axis of parallelism available at bs1: one M-block (no
+   query parallelism) and a sequential for-loop over the 16 selected blocks
+   inside each thread-block (no split-K). Both Triton parallel axes collapse to
+   serial in our design at decode.
+
+4. (NOT the limiter, ruled out)
+   - DRAM bandwidth: 16 blocks x 128 tokens x 4 kv-heads x 128 x 2(KV) x 2B
+     = ~4 MB of KV per token; at ~1.7 TB/s that is ~2.4us of pure load — far
+     below the 178us, so the kernel is COMPUTE/occupancy-bound, not mem-bound.
+     (Consistent with the time being flat across kv=4k..64k: it depends only on
+     the 16 selected blocks, not total context.)
+   - Launch overhead: profiler self-time is kernel-only; the 178us is on-GPU.
+   - smem/register pressure: smem is 48KB single-buffer (Q/K/V 64x128 bf16),
+     fits; this is not an occupancy *cap* — the cap is simply too-few blocks.
+
+SASS / KERNEL OPTIMISATION TARGET (concrete, actionable):
+   Add a DECODE specialization of forward_sparse_paged that (a) tiles the GQA
+   head group (BLK_M over the gqa_group_size = 16 q-heads sharing a kv-head),
+   not a 64-query M-tile, and (b) adds split-K over the selected blocks with a
+   small LSE-merge epilogue — i.e. mirror Triton's flash-decoding launch
+   geometry: grid ~ (num_kv_heads, num_topk_chunks [, query-token]). Target the
+   occupancy first (get from 64 to >=188 blocks), then kill the dead-row MMAs.
+   Expectation: closing both gaps should bring the decode kernel from ~179us
+   toward the few-us Triton range (the FLOP is tiny; this is pure mapping).

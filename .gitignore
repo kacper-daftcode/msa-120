@@ -31,3 +31,10 @@ profiles/
 .DS_Store
 tests/logs/
 .claude/
+# profiler binaries / build intermediates (kernel work)
+*.nsys-rep
+*.sqlite
+*.ii
+*.gpu
+**/sass_build/
+**/nsys_tmp/

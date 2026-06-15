@@ -1,0 +1,62 @@
+[
+  {
+    "op": "topk_select",
+    "regime": "decode",
+    "q_len": 1,
+    "seq_kv": 4096,
+    "nblk": 32,
+    "our_us": 6.42239972949028,
+    "triton_us": 19.751999527215958,
+    "our_wall_us": 9.247999638319016,
+    "triton_wall_us": 24.431999772787094,
+    "ratio": 3.0754858556248093
+  },
+  {
+    "op": "topk_select",
+    "regime": "decode",
+    "q_len": 1,
+    "seq_kv": 16384,
+    "nblk": 128,
+    "our_us": 6.424000114202499,
+    "triton_us": 19.58879977464676,
+    "our_wall_us": 9.440000168979168,
+    "triton_wall_us": 23.48800003528595,
+    "ratio": 3.049314979204136
+  },
+  {
+    "op": "topk_select",
+    "regime": "decode",
+    "q_len": 1,
+    "seq_kv": 65536,
+    "nblk": 512,
+    "our_us": 6.424000114202499,
+    "triton_us": 20.026399940252308,
+    "our_wall_us": 9.503999724984169,
+    "triton_wall_us": 32.00000151991844,
+    "ratio": 3.117434555453532
+  },
+  {
+    "op": "topk_select",
+    "regime": "prefill",
+    "q_len": 512,
+    "seq_kv": 512,
+    "nblk": 4,
+    "our_us": 3.9927998557686806,
+    "triton_us": 19.77439969778061,
+    "our_wall_us": 7.85600021481514,
+    "triton_wall_us": 27.648000046610832,
+    "ratio": 4.952514629354921
+  },
+  {
+    "op": "topk_select",
+    "regime": "prefill",
+    "q_len": 2048,
+    "seq_kv": 2048,
+    "nblk": 16,
+    "our_us": 6.362399831414223,
+    "triton_us": 20.05679979920387,
+    "our_wall_us": 9.631999768316746,
+    "triton_wall_us": 32.016001641750336,
+    "ratio": 3.1523953744896414
+  }
+]

@@ -1,0 +1,4 @@
+CAPTURE B: marlin prod (TP4, graph mode), 1 TP rank, bs1 steady-state decode
+window 11945.98ms, 1029 decode tokens = 11609us/token wall (86 tok/s)
+GPU busy 92.2%  |  GPU idle (inter-kernel gaps) 7.8%
+per-token: ~57 MSA sparse-attend layers, ~114 marlin GEMMs, ~121 all-reduces

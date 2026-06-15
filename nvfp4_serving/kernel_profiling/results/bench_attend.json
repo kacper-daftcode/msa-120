@@ -1,0 +1,72 @@
+[
+  {
+    "op": "sparse_attend",
+    "regime": "decode",
+    "q_len": 1,
+    "seq_kv": 4096,
+    "nblk": 32,
+    "sel": 16,
+    "our_us": 184.1816008090973,
+    "triton_us": 37.07199990749359,
+    "our_wall_us": 187.85599619150162,
+    "triton_wall_us": 42.27200150489807,
+    "ratio": 0.20127960526262562,
+    "note": "ours page-64, triton page-128, same logical seqlen/selected-blocks/heads"
+  },
+  {
+    "op": "sparse_attend",
+    "regime": "decode",
+    "q_len": 1,
+    "seq_kv": 16384,
+    "nblk": 128,
+    "sel": 16,
+    "our_us": 183.24959874153134,
+    "triton_us": 36.94159984588623,
+    "our_wall_us": 187.48799711465836,
+    "triton_wall_us": 41.840000078082085,
+    "ratio": 0.20159170933842735,
+    "note": "ours page-64, triton page-128, same logical seqlen/selected-blocks/heads"
+  },
+  {
+    "op": "sparse_attend",
+    "regime": "decode",
+    "q_len": 1,
+    "seq_kv": 65536,
+    "nblk": 512,
+    "sel": 16,
+    "our_us": 184.27040576934814,
+    "triton_us": 36.820800602436066,
+    "our_wall_us": 188.83199989795685,
+    "triton_wall_us": 41.200000792741776,
+    "ratio": 0.19981939285749867,
+    "note": "ours page-64, triton page-128, same logical seqlen/selected-blocks/heads"
+  },
+  {
+    "op": "sparse_attend",
+    "regime": "prefill",
+    "q_len": 512,
+    "seq_kv": 512,
+    "nblk": 4,
+    "sel": 4,
+    "our_us": 143.40239763259888,
+    "triton_us": 137.83040046691895,
+    "our_wall_us": 146.84799313545227,
+    "triton_wall_us": 159.13600474596024,
+    "ratio": 0.9611443235422357,
+    "note": "ours page-64, triton page-128, same logical seqlen/selected-blocks/heads"
+  },
+  {
+    "op": "sparse_attend",
+    "regime": "prefill",
+    "q_len": 2048,
+    "seq_kv": 2048,
+    "nblk": 16,
+    "sel": 16,
+    "our_us": 1675.4888534545898,
+    "triton_us": 1679.5256614685059,
+    "our_wall_us": 1677.5360107421875,
+    "triton_wall_us": 1703.823983669281,
+    "ratio": 1.0024093314650186,
+    "note": "ours page-64, triton page-128, same logical seqlen/selected-blocks/heads"
+  }
+]

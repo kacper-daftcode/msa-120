@@ -1,0 +1,28 @@
+== ONE TP RANK ==  span=11946.0ms  busy=11014.2ms (92.2%) idle=7.8%
+sum-of-kernel-durations (overlap incl) = 13165.8ms
+
+   %dur         tot    count  category | top kernel
+ 39.46%    5195187us   426837  DENSE GEMM (proj/linear)   | void cutlass::Kernel2<cutlass_80_wmma_te=2365189us
+ 17.43%    2294593us   125463  ALL_REDUCE (PYNCCL)        | ncclDevKernel_AllReduce_Sum_bf16_RING_LL=2244367us
+ 15.31%    2016087us   117232  MoE marlin GEMM            | void marlin_moe_wna16::Marlin<(long)1125=1249033us
+  7.69%    1012695us   234464  MoE route/permute          | void vllm::moe::moe_align_block_size_ker=499132us
+  4.33%     569692us   175736  MSA indexer/topk           | _topk_index_partial_kernel=208698us
+  3.38%     444390us   117175  MSA sparse-attend          | _gqa_sparse_decode_kernel=337163us
+  3.16%     416377us   131635  DENSE attn (3 layers)      | kernel_cutlass_kernel_flashinfernormkern=302139us
+  2.86%     376409us   120319  activation                 | void vllm::act_and_mul_kernel<c10::BFloa=376409us
+  2.63%     345901us   254016  elementwise/copy           | void at::native::unrolled_elementwise_ke=143974us
+  2.31%     304618us    61703  quant->fp4 (MoE feed)      | void vllm::cvt_fp16_to_fp4<__nv_bfloat16=304618us
+  1.00%     131856us    61704  norm/rope                  | void vllm::minimax_m3_fused_ops::fusedMi=125754us
+  0.39%      51248us     1029  softmax(sampling)          | void at::native::<unnamed>::cunn_SoftMax=51248us
+  0.04%       4794us     3087  OTHER:void vllm::reshape_and_cache_flash | void vllm::reshape_and_cache_flash_kerne=4794us
+  0.01%       1737us     1028  OTHER:void at::native::<unnamed>::indexS | void at::native::<unnamed>::indexSelectS=1737us
+  0.00%        248us       57  OTHER:_index_block_score_kernel | _index_block_score_kernel=248us
+  0.00%          2us        2  OTHER:void at_cuda_detail::cub::detail:: | void at_cuda_detail::cub::detail::scan::=1us
+  0.00%          2us        1  OTHER:void at::native::vectorized_gather | void at::native::vectorized_gather_kerne=2us
+
+== SUPER-CATEGORIES (% of sum-of-kernel-durations) ==
+  MSA TOTAL              7.70%  (1014081us)
+  MoE TOTAL             25.32%  (3333400us)
+  DENSE-attn+proj       42.62%  (5611564us)
+  ALL_REDUCE            17.43%  (2294593us)
+  GPU idle (gaps)        7.80%  (of wall, merged-interval)

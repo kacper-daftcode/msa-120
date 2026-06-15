@@ -1,0 +1,62 @@
+CMD: nvcc -gencode=arch=compute_120f,code=sm_120f -O3 -std=c++17 --expt-relaxed-constexpr -lineinfo -Xptxas -v --ptxas-options=-v -I/work/decode_kernel -I/usr/local/lib/python3.12/dist-packages/torch/include -I/usr/local/lib/python3.12/dist-packages/torch/include/torch/csrc/api/include -I/usr/include/python3.12 --keep --keep-dir /work/decode_kernel/nsys_stats/sass_build -cubin /work/decode_kernel/sm120_fmha_decode.cu -o /work/decode_kernel/nsys_stats/sass_build/sm120_fmha_decode.cubin
+=== STDOUT ===
+
+=== STDERR (ptxas -v) ===
+/work/decode_kernel/sm120_fmha_decode.cu(112): warning #550-D: variable "smem_addr" was set but never used
+      uint32_t smem_addr, r;
+               ^
+
+Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+
+/work/decode_kernel/sm120_fmha_decode.cu(287): warning #177-D: variable "valid" was declared but never referenced
+          const bool valid = valid_cur;
+                     ^
+
+/work/decode_kernel/sm120_fmha_decode.cu(224): warning #177-D: variable "nt_base" was declared but never referenced
+      const int nt_base = wid * 2;
+                ^
+
+/work/decode_kernel/sm120_fmha_decode.cu(225): warning #177-D: variable "key_base" was declared but never referenced
+      const int key_base = wid * 16;
+                ^
+
+/work/decode_kernel/sm120_fmha_decode.cu(489): warning #177-D: variable "l" was declared but never referenced
+          float m = Mc[c], l = Lc[c];
+                           ^
+
+/work/decode_kernel/sm120_fmha_decode.cu(676): warning #177-D: variable "Kpn" was declared but never referenced
+          int kvv_nxt = 0; const __nv_bfloat16 *Kpn=nullptr,*Vpn=nullptr;
+                                                ^
+
+/work/decode_kernel/sm120_fmha_decode.cu(676): warning #177-D: variable "Vpn" was declared but never referenced
+          int kvv_nxt = 0; const __nv_bfloat16 *Kpn=nullptr,*Vpn=nullptr;
+                                                             ^
+
+ptxas info    : 28 bytes gmem
+ptxas info    : Compiling entry function 'sm120_fmha_decode_partial_p128_sub64' for 'sm_120f'
+ptxas info    : Function properties for sm120_fmha_decode_partial_p128_sub64
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 126 registers, used 1 barriers, 80 bytes smem
+ptxas info    : Compile time = 93.180 ms
+ptxas info    : Compiling entry function 'sm120_fmha_decode_partial_p128_4w' for 'sm_120f'
+ptxas info    : Function properties for sm120_fmha_decode_partial_p128_4w
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 234 registers, used 1 barriers
+ptxas info    : Compile time = 54.753 ms
+ptxas info    : Compiling entry function 'sm120_fmha_decode_partial_p128' for 'sm_120f'
+ptxas info    : Function properties for sm120_fmha_decode_partial_p128
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 246 registers, used 1 barriers
+ptxas info    : Compile time = 198.324 ms
+ptxas info    : Compiling entry function 'sm120_fmha_decode_merge_bf16' for 'sm_120f'
+ptxas info    : Function properties for sm120_fmha_decode_merge_bf16
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 42 registers, used 1 barriers
+ptxas info    : Compile time = 26.492 ms
+ptxas info    : Compiling entry function 'sm120_fmha_decode_partial_bf16' for 'sm_120f'
+ptxas info    : Function properties for sm120_fmha_decode_partial_bf16
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 246 registers, used 1 barriers
+ptxas info    : Compile time = 110.194 ms
+
+rc= 0

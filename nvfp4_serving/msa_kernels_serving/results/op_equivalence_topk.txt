@@ -1,0 +1,12 @@
+   B init local  Qpos   match/total  result
+--------------------------------------------------------
+  20    0     0   end      4/4       OK
+  20    1     1   end      4/4       OK
+  32    2     3   end      4/4       OK
+  64    0     1   end      4/4       OK
+  40    4     4   end      4/4       OK
+  17    0     0   end      4/4       OK
+  16    0     0   end      4/4       OK
+   8    1     1   end      4/4       OK
+----------------------------------------------------
+VERDICT: ALL MATCH (set-exact)
