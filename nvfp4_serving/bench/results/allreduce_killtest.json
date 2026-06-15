@@ -1,0 +1,47 @@
+{
+  "rank": 0,
+  "world_size": 4,
+  "per_M": [
+    {
+      "M": 1,
+      "bytes": 12288,
+      "nccl_us": 18.003,
+      "custom_oneshot_us": 17.408,
+      "custom_rel_err_vs_nccl": 0.004386,
+      "winner": "custom"
+    },
+    {
+      "M": 8,
+      "bytes": 98304,
+      "nccl_us": 26.164,
+      "custom_oneshot_us": 176.021,
+      "custom_rel_err_vs_nccl": 0.003425,
+      "winner": "nccl"
+    },
+    {
+      "M": 32,
+      "bytes": 393216,
+      "nccl_us": 81.341,
+      "custom_oneshot_us": 1031.604,
+      "custom_rel_err_vs_nccl": 0.006711,
+      "winner": "nccl"
+    },
+    {
+      "M": 64,
+      "bytes": 786432,
+      "nccl_us": 74.008,
+      "custom_oneshot_us": 962.026,
+      "custom_rel_err_vs_nccl": 0.006757,
+      "winner": "nccl"
+    },
+    {
+      "M": 256,
+      "bytes": 3145728,
+      "nccl_us": 183.956,
+      "custom_oneshot_us": 4469.112,
+      "custom_rel_err_vs_nccl": 0.006579,
+      "winner": "nccl"
+    }
+  ],
+  "custom_err": null
+}

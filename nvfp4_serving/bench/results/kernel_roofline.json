@@ -1,0 +1,280 @@
+{
+  "dense": [
+    {
+      "comp": "dense_6144x6144",
+      "M": 1,
+      "ms": 0.0187,
+      "tflops_bf16proxy": 4.0,
+      "gbps_if_bf16_wstream": 4040.2,
+      "nvfp4_wfloor_ms": 0.0119,
+      "ms_over_nvfp4floor": 1.58
+    },
+    {
+      "comp": "dense_6144x6144",
+      "M": 8,
+      "ms": 0.0227,
+      "tflops_bf16proxy": 26.6,
+      "gbps_if_bf16_wstream": 3331.5,
+      "nvfp4_wfloor_ms": 0.0119,
+      "ms_over_nvfp4floor": 1.92
+    },
+    {
+      "comp": "dense_6144x6144",
+      "M": 32,
+      "ms": 0.0288,
+      "tflops_bf16proxy": 83.8,
+      "gbps_if_bf16_wstream": 2647.5,
+      "nvfp4_wfloor_ms": 0.0119,
+      "ms_over_nvfp4floor": 2.43
+    },
+    {
+      "comp": "dense_6144x6144",
+      "M": 64,
+      "ms": 0.0275,
+      "tflops_bf16proxy": 175.6,
+      "gbps_if_bf16_wstream": 2801.4,
+      "nvfp4_wfloor_ms": 0.0119,
+      "ms_over_nvfp4floor": 2.32
+    },
+    {
+      "comp": "dense_6144x6144",
+      "M": 256,
+      "ms": 0.0754,
+      "tflops_bf16proxy": 256.2,
+      "gbps_if_bf16_wstream": 1084.1,
+      "nvfp4_wfloor_ms": 0.0119,
+      "ms_over_nvfp4floor": 6.36
+    },
+    {
+      "comp": "dense_6144x6144",
+      "M": 512,
+      "ms": 0.1339,
+      "tflops_bf16proxy": 288.6,
+      "gbps_if_bf16_wstream": 657.6,
+      "nvfp4_wfloor_ms": 0.0119,
+      "ms_over_nvfp4floor": 11.29
+    },
+    {
+      "comp": "dense_6144x6144",
+      "M": 2048,
+      "ms": 0.4642,
+      "tflops_bf16proxy": 333.1,
+      "gbps_if_bf16_wstream": 271.1,
+      "nvfp4_wfloor_ms": 0.0119,
+      "ms_over_nvfp4floor": 39.13
+    },
+    {
+      "comp": "dense_6144x6144",
+      "M": 8192,
+      "ms": 1.5889,
+      "tflops_bf16proxy": 389.2,
+      "gbps_if_bf16_wstream": 174.2,
+      "nvfp4_wfloor_ms": 0.0119,
+      "ms_over_nvfp4floor": 133.95
+    },
+    {
+      "comp": "dense_6144x3072",
+      "M": 1,
+      "ms": 0.0145,
+      "tflops_bf16proxy": 2.6,
+      "gbps_if_bf16_wstream": 2603.7,
+      "nvfp4_wfloor_ms": 0.0059,
+      "ms_over_nvfp4floor": 2.45
+    },
+    {
+      "comp": "dense_6144x3072",
+      "M": 8,
+      "ms": 0.0186,
+      "tflops_bf16proxy": 16.3,
+      "gbps_if_bf16_wstream": 2040.6,
+      "nvfp4_wfloor_ms": 0.0059,
+      "ms_over_nvfp4floor": 3.13
+    },
+    {
+      "comp": "dense_6144x3072",
+      "M": 32,
+      "ms": 0.0165,
+      "tflops_bf16proxy": 73.1,
+      "gbps_if_bf16_wstream": 2319.5,
+      "nvfp4_wfloor_ms": 0.0059,
+      "ms_over_nvfp4floor": 2.79
+    },
+    {
+      "comp": "dense_6144x3072",
+      "M": 64,
+      "ms": 0.0165,
+      "tflops_bf16proxy": 146.3,
+      "gbps_if_bf16_wstream": 2356.6,
+      "nvfp4_wfloor_ms": 0.0059,
+      "ms_over_nvfp4floor": 2.79
+    },
+    {
+      "comp": "dense_6144x3072",
+      "M": 256,
+      "ms": 0.0391,
+      "tflops_bf16proxy": 247.1,
+      "gbps_if_bf16_wstream": 1085.9,
+      "nvfp4_wfloor_ms": 0.0059,
+      "ms_over_nvfp4floor": 6.59
+    },
+    {
+      "comp": "dense_6144x3072",
+      "M": 512,
+      "ms": 0.0733,
+      "tflops_bf16proxy": 263.7,
+      "gbps_if_bf16_wstream": 643.7,
+      "nvfp4_wfloor_ms": 0.0059,
+      "ms_over_nvfp4floor": 12.36
+    },
+    {
+      "comp": "dense_6144x3072",
+      "M": 2048,
+      "ms": 0.2417,
+      "tflops_bf16proxy": 319.8,
+      "gbps_if_bf16_wstream": 312.3,
+      "nvfp4_wfloor_ms": 0.0059,
+      "ms_over_nvfp4floor": 40.76
+    },
+    {
+      "comp": "dense_6144x3072",
+      "M": 8192,
+      "ms": 0.8245,
+      "tflops_bf16proxy": 375.1,
+      "gbps_if_bf16_wstream": 228.9,
+      "nvfp4_wfloor_ms": 0.0059,
+      "ms_over_nvfp4floor": 139.0
+    }
+  ],
+  "moe": {
+    "err": "dynamic import: ImportError(\"cannot import name 'dynamic_swigluoai_nvfp4_moe' from 'batched_dynamic_moe' (/work/bench/../cutlass_fp4_moe/batched_dynamic_moe.py)\")",
+    "rows": [
+      {
+        "M": 1,
+        "bf16_ms": 0.0236,
+        "bf16_tflops": 1.2,
+        "nvfp4_wfloor_ms": 0.0044,
+        "ms_over_floor": 5.31
+      },
+      {
+        "M": 8,
+        "bf16_ms": 0.0268,
+        "bf16_tflops": 8.4,
+        "nvfp4_wfloor_ms": 0.0044,
+        "ms_over_floor": 6.03
+      },
+      {
+        "M": 32,
+        "bf16_ms": 0.0308,
+        "bf16_tflops": 29.4,
+        "nvfp4_wfloor_ms": 0.0044,
+        "ms_over_floor": 6.93
+      },
+      {
+        "M": 64,
+        "bf16_ms": 0.0296,
+        "bf16_tflops": 61.3,
+        "nvfp4_wfloor_ms": 0.0044,
+        "ms_over_floor": 6.65
+      },
+      {
+        "M": 256,
+        "bf16_ms": 0.0514,
+        "bf16_tflops": 141.1,
+        "nvfp4_wfloor_ms": 0.0044,
+        "ms_over_floor": 11.55
+      },
+      {
+        "M": 512,
+        "bf16_ms": 0.0761,
+        "bf16_tflops": 190.5,
+        "nvfp4_wfloor_ms": 0.0044,
+        "ms_over_floor": 17.1
+      },
+      {
+        "M": 2048,
+        "bf16_ms": 0.2327,
+        "bf16_tflops": 249.2,
+        "nvfp4_wfloor_ms": 0.0044,
+        "ms_over_floor": 52.3
+      },
+      {
+        "M": 8192,
+        "bf16_ms": 0.7245,
+        "bf16_tflops": 320.1,
+        "nvfp4_wfloor_ms": 0.0044,
+        "ms_over_floor": 162.87
+      }
+    ]
+  },
+  "fp4_vs_bf16_gemm": {
+    "err": null,
+    "rows": [
+      {
+        "M": 1,
+        "fp4_kernel_ms": 0.0285,
+        "bf16_kernel_ms": 0.0106,
+        "fp4_tflops": 0.7,
+        "bf16_tflops": 1.8,
+        "fp4_speedup_vs_bf16": 0.371
+      },
+      {
+        "M": 8,
+        "fp4_kernel_ms": 0.0286,
+        "bf16_kernel_ms": 0.0124,
+        "fp4_tflops": 5.3,
+        "bf16_tflops": 12.1,
+        "fp4_speedup_vs_bf16": 0.435
+      },
+      {
+        "M": 32,
+        "fp4_kernel_ms": 0.0286,
+        "bf16_kernel_ms": 0.0145,
+        "fp4_tflops": 21.1,
+        "bf16_tflops": 41.7,
+        "fp4_speedup_vs_bf16": 0.506
+      },
+      {
+        "M": 64,
+        "fp4_kernel_ms": 0.0286,
+        "bf16_kernel_ms": 0.0144,
+        "fp4_tflops": 42.3,
+        "bf16_tflops": 83.6,
+        "fp4_speedup_vs_bf16": 0.506
+      },
+      {
+        "M": 256,
+        "fp4_kernel_ms": 0.0289,
+        "bf16_kernel_ms": 0.0268,
+        "fp4_tflops": 167.1,
+        "bf16_tflops": 180.6,
+        "fp4_speedup_vs_bf16": 0.925
+      },
+      {
+        "M": 512,
+        "fp4_kernel_ms": 0.0306,
+        "bf16_kernel_ms": 0.0411,
+        "fp4_tflops": 315.7,
+        "bf16_tflops": 234.9,
+        "fp4_speedup_vs_bf16": 1.344
+      },
+      {
+        "M": 2048,
+        "fp4_kernel_ms": 0.0585,
+        "bf16_kernel_ms": 0.1335,
+        "fp4_tflops": 660.7,
+        "bf16_tflops": 289.6,
+        "fp4_speedup_vs_bf16": 2.282
+      },
+      {
+        "M": 8192,
+        "fp4_kernel_ms": 0.1366,
+        "bf16_kernel_ms": 0.45,
+        "fp4_tflops": 1131.8,
+        "bf16_tflops": 343.6,
+        "fp4_speedup_vs_bf16": 3.294
+      }
+    ]
+  },
+  "hbm_tbps": 1790000000000.0,
+  "note": "bf16 GEMM as marlin-W4A16 compute proxy; nvfp4_wfloor = NVFP4 weight-load time at HBM peak (bound-type ref)"
+}

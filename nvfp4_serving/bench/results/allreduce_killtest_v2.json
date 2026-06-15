@@ -1,0 +1,52 @@
+{
+  "rank": 0,
+  "world_size": 4,
+  "ops_per_graph": 20,
+  "iters": 200,
+  "per_M": [
+    {
+      "M": 1,
+      "bytes": 12288,
+      "nccl_us_graph": 16.822,
+      "nccl_us_eager": 17.324,
+      "custom_us_graph": 14.587,
+      "custom_us_eager": 18.103,
+      "custom_rel_err": 0.003984,
+      "in_graph_winner": "custom",
+      "speedup_custom_over_nccl": 1.153
+    },
+    {
+      "M": 8,
+      "bytes": 98304,
+      "nccl_us_graph": 24.743,
+      "nccl_us_eager": 25.489,
+      "custom_us_graph": 173.887,
+      "custom_us_eager": 171.696,
+      "custom_rel_err": 0.007576,
+      "in_graph_winner": "nccl",
+      "speedup_custom_over_nccl": 0.142
+    },
+    {
+      "M": 32,
+      "bytes": 393216,
+      "nccl_us_graph": 80.344,
+      "nccl_us_eager": 80.807,
+      "custom_us_graph": 1029.217,
+      "custom_us_eager": 1058.911,
+      "custom_rel_err": 0.006944,
+      "in_graph_winner": "nccl",
+      "speedup_custom_over_nccl": 0.078
+    },
+    {
+      "M": 64,
+      "bytes": 786432,
+      "nccl_us_graph": 73.161,
+      "nccl_us_eager": 73.499,
+      "custom_us_graph": 955.358,
+      "custom_us_eager": 959.234,
+      "custom_rel_err": 0.006803,
+      "in_graph_winner": "nccl",
+      "speedup_custom_over_nccl": 0.077
+    }
+  ]
+}

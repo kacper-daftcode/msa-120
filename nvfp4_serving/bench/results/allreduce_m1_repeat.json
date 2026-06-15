@@ -1,0 +1,33 @@
+{
+  "rank": 0,
+  "trials": [
+    {
+      "nccl_us": 16.635,
+      "custom_us": 14.244,
+      "speedup": 1.168
+    },
+    {
+      "nccl_us": 16.979,
+      "custom_us": 14.41,
+      "speedup": 1.178
+    },
+    {
+      "nccl_us": 16.998,
+      "custom_us": 14.273,
+      "speedup": 1.191
+    },
+    {
+      "nccl_us": 16.653,
+      "custom_us": 14.476,
+      "speedup": 1.15
+    },
+    {
+      "nccl_us": 16.796,
+      "custom_us": 14.518,
+      "speedup": 1.157
+    }
+  ],
+  "median_speedup": 1.168,
+  "median_nccl_us": 16.796,
+  "median_custom_us": 14.41
+}
