@@ -50,6 +50,9 @@ static constexpr int HEAD_DIM = 128;
 static constexpr int MMA_N = 8;
 static constexpr int MMA_K_BF16 = 16;
 static constexpr int MMA_K_FP8 = 32;
+// The cross-warp softmax reduction reads the NUM_WARPS per-warp partials as one
+// float4 LDS.128. That vectorization assumes exactly 4 warps.
+static_assert(NUM_WARPS == 4, "cross-warp float4 sRed reduction requires NUM_WARPS==4");
 
 __device__ __forceinline__ void cp_async_16b(void *smem, const void *gmem) {
     uint32_t smem_addr;
@@ -405,14 +408,23 @@ sm120_serve_decode_partial_p128_ldsm(
           tt=__shfl_xor_sync(0xffffffff,mx0,2); mx0=fmaxf(mx0,tt);
           tt=__shfl_xor_sync(0xffffffff,mx1,1); mx1=fmaxf(mx1,tt);
           tt=__shfl_xor_sync(0xffffffff,mx1,2); mx1=fmaxf(mx1,tt); }
-        if (sub == 0) { sRed[(wid*GQA + grp)*2 + 0] = mx0; sRed[(wid*GQA + grp + 8)*2 + 0] = mx1; }
-        __syncthreads();
-        float pmx0 = mx0, pmx1 = mx1;
-        #pragma unroll
-        for (int w = 0; w < NUM_WARPS; w++) {
-            pmx0 = fmaxf(pmx0, sRed[(w*GQA + grp)*2 + 0]);
-            pmx1 = fmaxf(pmx1, sRed[(w*GQA + grp + 8)*2 + 0]);
+        // ---- cross-warp max merge: VECTORIZED-LDS layout -------------------
+        // sRed is laid out [row(16) x {max,sum}(2) x warp(NUM_WARPS)] so the
+        // NUM_WARPS partials a thread reduces for one head-row are CONTIGUOUS in
+        // smem. With NUM_WARPS==4 that's one 128-bit LDS.128 (float4) per row
+        // instead of 4 scalar LDS.32 -> the cross-warp read issues 4x fewer LDS
+        // instructions on the softmax critical path (the +23,808-LDS limiter).
+        // Each warp's sub==0 lane writes its scalar partial (the 4 sub-lanes of a
+        // grp already hold the SAME max after the intra-warp shuffle above).
+        if (sub == 0) {
+            sRed[(grp*2 + 0)*NUM_WARPS + wid]     = mx0;
+            sRed[((grp+8)*2 + 0)*NUM_WARPS + wid] = mx1;
         }
+        __syncthreads();
+        float4 vmx0 = *reinterpret_cast<const float4*>(&sRed[(grp*2 + 0)*NUM_WARPS]);
+        float4 vmx1 = *reinterpret_cast<const float4*>(&sRed[((grp+8)*2 + 0)*NUM_WARPS]);
+        float pmx0 = fmaxf(fmaxf(vmx0.x, vmx0.y), fmaxf(vmx0.z, vmx0.w));
+        float pmx1 = fmaxf(fmaxf(vmx1.x, vmx1.y), fmaxf(vmx1.z, vmx1.w));
         float mn0=fmaxf(rm[0],pmx0), mn1=fmaxf(rm[1],pmx1);
         float s0=(rm[0]==-INFINITY)?0.f:exp2f(LG2E*(rm[0]-mn0));
         float s1=(rm[1]==-INFINITY)?0.f:exp2f(LG2E*(rm[1]-mn1));
@@ -434,7 +446,13 @@ sm120_serve_decode_partial_p128_ldsm(
           tt=__shfl_xor_sync(0xffffffff,ls0,2); ls0+=tt;
           tt=__shfl_xor_sync(0xffffffff,ls1,1); ls1+=tt;
           tt=__shfl_xor_sync(0xffffffff,ls1,2); ls1+=tt; }
-        if (sub == 0) { sRed[(wid*GQA + grp)*2 + 1] = ls0; sRed[(wid*GQA + grp + 8)*2 + 1] = ls1; }
+        // ---- cross-warp denom merge: same VECTORIZED-LDS layout ({sum} slot).
+        // sub==0 lane writes its partial denom; the sPbf P-write below overlaps
+        // the smem latency between the __syncthreads and the float4 read-back.
+        if (sub == 0) {
+            sRed[(grp*2 + 1)*NUM_WARPS + wid]     = ls0;
+            sRed[((grp+8)*2 + 1)*NUM_WARPS + wid] = ls1;
+        }
         // ---- write this warp's 32 P-bf16 into shared sPbf[16 x 128] ----
         //   P[head][key], key = key0 + nt*8 + {sub*2, sub*2+1}.
         #pragma unroll
@@ -446,12 +464,10 @@ sm120_serve_decode_partial_p128_ldsm(
             sPbf[(grp+8)*LDSM_PLD + kv_col + 1] = __float2bfloat16(Sr[nt][3]);
         }
         __syncthreads();
-        float gl0=0.f, gl1=0.f;
-        #pragma unroll
-        for (int w=0; w<NUM_WARPS; w++){
-            gl0 += sRed[(w*GQA + grp)*2 + 1];
-            gl1 += sRed[(w*GQA + grp + 8)*2 + 1];
-        }
+        float4 vsl0 = *reinterpret_cast<const float4*>(&sRed[(grp*2 + 1)*NUM_WARPS]);
+        float4 vsl1 = *reinterpret_cast<const float4*>(&sRed[((grp+8)*2 + 1)*NUM_WARPS]);
+        float gl0 = (vsl0.x + vsl0.y) + (vsl0.z + vsl0.w);
+        float gl1 = (vsl1.x + vsl1.y) + (vsl1.z + vsl1.w);
         rm[0]=mn0; rm[1]=mn1; rl[0]+=gl0; rl[1]+=gl1;
 
         // V must have landed (it streamed during QK+softmax).

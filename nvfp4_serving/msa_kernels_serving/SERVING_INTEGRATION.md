@@ -155,3 +155,133 @@ the kernel can't reach parity net of the merge overhead.
   paged score-only pybind).
 - Spec-decode (decode_query_len>1) currently routes to Triton; our kernel is
   query_len==1 specialized.
+
+---
+
+## Phase 1b — warp-shuffle / vectorized-LDS softmax reduction (2026-06-15)
+
+Goal: close the ~3% decode regression by lightening the decode-attend softmax /
+cross-warp reduction (the GEOMETRY_TUNING `+23,808 LDS` / `+25 % instructions`
+limiter), then re-integrate, re-measure, and ship the maximal no-regression
+config. The MMA feed (LDSM/HMMA, byte-identical to Triton) was NOT touched.
+
+### What was changed in `sm120_fmha_decode_serving.cu`
+The cross-warp online-softmax merge (row-max and row-sum across the 4 key-split
+warps, the only plain-`LDS` path in the partial — QK/PV are all `ldmatrix`) was
+rewritten:
+- The intra-warp (lane) reduction of max/sum was ALREADY warp-shuffle
+  (`__shfl_xor_sync`) in the shipped kernel; that was kept.
+- The **cross-warp** merge previously read `sRed` with a per-warp scalar loop
+  (`for w<NUM_WARPS: pmx=fmax(pmx, sRed[(w*GQA+grp)*2+...])`) — 16 scalar
+  `LDS.32` per warp per page-step (8 for max + 8 for sum). `sRed` was relaid out
+  to `[row(16) x {max,sum}(2) x warp(4)]` so the 4 per-warp partials a thread
+  reduces are **contiguous**, and the read is now **one `LDS.128` (float4) per
+  row** instead of 4 scalar `LDS.32`. (`static_assert(NUM_WARPS==4)` guards the
+  float4 vectorization; `sRed` is 16B-aligned so the loads are legal.)
+- Graph-capture safety, fused-cache / per-kv-head / device-seq_lens interface,
+  and the -1-pad-page NaN fix are all preserved unchanged.
+
+### Reduction before -> after (ncu, partial kernel, warm cache, bs1 seq=16384)
+| metric | shipped (scalar `sRed`) | this change (float4 `sRed`) |
+|---|---:|---:|
+| executed `shared_ld` (LDS) | 30 208 | **27 136** (-3 072) |
+| executed `ldmatrix` (LDSM) | 12 288 | 12 288 (unchanged) |
+| executed `shared_st` (STS) | 7 168 | 7 168 |
+| `sm__inst_executed` | 412 288 | 413 824 |
+| `wait` stall % | 34.2 | 33.1 |
+| long-scoreboard stall % | 12.6 | 10.6 |
+| partial gpu_duration (ncu warm) | 4.58 us | **4.50 us** |
+
+torch-profiler back-to-back (the live-representative measure), partial-only,
+3 runs each: shipped **4.42-4.44 us** vs this change **4.50-4.51 us** — i.e.
+**LATENCY-NEUTRAL, ~noise** (the two methods disagree by <2 %, no real move).
+
+### Why the LDS fix did not move latency — the diagnosis was partly mis-attributed
+SASS (`nvdisasm`) of the partial kernel shows the `+23,808 LDS` are NOT the
+softmax reduction. Of the 33 scalar `LDS` in the SASS, 29 are
+**`@!PT LDS RZ, [RZ]`** — predicated-OFF, never-executed `ldmatrix`-companion
+padding slots that ptxas emits next to every LDSM. Only the cross-warp reduction
+is genuinely reducible plain-LDS, and it was just **~3,072 of the 30,208** (the
+float4 rewrite eliminates exactly those, leaving 27,136 — the untouchable
+ldmatrix-companion slots). And those ~3k reduction-LDS are NOT on the critical
+path: GEOMETRY_TUNING already established the partial is **`wait`-stall bound
+(33-35 %, the fixed-latency exp2f/MMA pipe) at 0.93 warps/scheduler**, not LDS
+throughput bound — at bs1 the 64-independent-work-unit grid leaves the SMs 25 %
+active, so the exp2f/MMA latency is fully exposed regardless of LDS count.
+**Eliminating the reduction LDS is correct and cleaner, but cannot recover the
+decode regression — the limiter is the bs1 wave/wait ceiling, not the softmax
+LDS.** (Key-split W4=5 hits partial Triton-parity but the merge gives it back —
+the unchanged partial<->merge chunk-count coupling from GEOMETRY_TUNING.)
+
+The float4-LDS reduction is KEPT in the source: it is correct (full 46-case +
+poison gate, rms identical: 1.3e-3-2.9e-3 vs golden), reduces real LDS, and is
+latency-neutral — the right state for any future Phase-2 work. It does not, on
+its own, change the ship decision.
+
+### Re-integration gates (this change, `launch_msa.sh graph`)
+- Correctness: `verify_decode_serving.py` ALL OK — rms vs golden 1.3e-3-2.9e-3
+  (< 1e-2), vs dense < 3e-4, NaN-free on -1-pad cases. Identical to shipped.
+- FULL decode cudagraph: `Capturing CUDA graphs (decode, FULL): 100% 51/51`,
+  **no StreamCaptureInvalidated**, `Graph capturing finished in 16 secs, 3.26
+  GiB`. Selector routed all sparse layers to `MiniMaxM3SparseSm120Impl`. PASSED.
+- Coherence: Warsaw; `17 times 23 = 391`; `sum(i*i for i in range(1, n+1))`.
+
+### Re-measured full serving (this box, 2026-06-15, identical methodology)
+Decode bs1 is the deciding metric. Clean A/B, decode-only 16 reqs x 200 tok,
+median of 3 runs each, same server config (TP4, graph FULL):
+
+| config | decode bs1 (decode-only, 3-run median) | vs marlin |
+|---|---:|---:|
+| **marlin baseline** | 91.5 / 91.92 / 92.08 -> **91.92 tok/s** | — |
+| **ours-MSA (float4-LDS)** | 88.88 / 89.1 / 89.27 -> **89.10 tok/s** | **-3.1 %** |
+
+Full bench (decode 16x200 + prefill + sweep), single run:
+
+| metric | marlin (shipped) | ours-MSA | delta |
+|---|---:|---:|---:|
+| decode bs1 tok/s | **91.87** | 87.83 | -4.4 %* |
+| prefill tok/s | 5575 | 5559 | -0.3 % (Triton, neutral) |
+| sweep c=1 out tok/s | 88.05 | 82.30 | -6.5 %* |
+| sweep c=8 out tok/s | 482.14 | 467.12 | -3.1 % |
+| sweep c=32 out tok/s | 937.91 | 942.03 | +0.4 % |
+
+(*the full-bench decode/c=1 numbers are noisier because prefill+sweep load
+contaminates the bs1 timing window; the clean decode-only A/B above, -3.1 %, is
+the authoritative decode figure. TPOT confirms: ours 11.39 vs marlin 10.89 ms.)
+
+### Verdict & SHIPPED config
+**No-perf-loss bar: NOT met. Decode regression is a stable -3.1 % (89.1 vs 91.9
+tok/s), beyond the ~2 % bar.** The softmax-LDS lightening landed and is correct
+but latency-neutral (the limiter is the bs1 wait/wave ceiling, not LDS) — it
+does not bring the decode-attend to Triton parity, so branch 1 (ship our full
+decode-attend) fails the no-regression gate.
+
+Decision tree:
+1. Our full decode-attend (lightened): **-3.1 %, FAILS** the within-~2 % bar.
+2. Hybrid (our topk + our prefill, Triton decode-attend): **NOT BUILDABLE** in
+   Phase 1 — topk-on-our-code and prefill-on-our-code are Phase 2/3 (gated
+   behind the missing paged score-only pybind and the prefill-attend swap); this
+   impl only swaps decode-attend, with topk+prefill already on Triton. There is
+   no "our topk/our prefill" config to ship as a no-regression hybrid.
+3. **-> Restore marlin. SHIPPED: `/home/kacper/launch_marlin.sh graph`.**
+
+The box is LEFT SERVING marlin (relaunched, verified): decode bs1 = **91.87
+tok/s** (full bench) / **91.92** (clean decode-only median) >= baseline 90.7,
+coherent (Warsaw, 391, `sum(i*i for i in range(1, n+1))`), FULL decode graph
+captured (0 StreamCaptureInvalidated, 3.22 GiB), prefill 5575 / sweep
+88/482/938. Honest answer to "did our code ship at no perf loss?": **no — our
+decode-attend is -3.1 %, an intrinsic bs1 wave/wait ceiling, not a wiring or LDS
+artifact; the no-regression config is marlin, and it is what is serving.**
+
+### Reproduce
+```
+# kernel gates (GPU0 verify container, ncu/nsys host-mounted):
+docker exec msa-verify python3 /work/msa_kernels_serving/verify_decode_serving.py   # ALL OK
+docker exec msa-verify python3 /work/msa_kernels_serving/bench_decode_serving.py     # partial+merge us
+docker exec msa-verify /opt/ncu/ncu --kernel-name regex:partial_p128_ldsm \
+  --cache-control none --metrics smsp__inst_executed_op_shared_ld.sum,... \
+  python3 /work/msa_kernels_serving/ncu_driver_serving.py                            # LDS/stall
+# end-to-end:
+bash msa_kernels_serving/launch_msa.sh graph   # ours; or  /home/kacper/launch_marlin.sh graph
+python3 bench/bench_client.py --decode-reqs 16 --output-len 200 ...                  # decode bs1
+```
