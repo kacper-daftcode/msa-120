@@ -1,16 +1,28 @@
 #!/usr/bin/env bash
-# Serve MiniMax-M3-NVFP4 with marlin MoE + OUR SM120 MSA decode-attend kernel.
+# Serve MiniMax-M3-NVFP4 with marlin MoE + OUR SM120 MSA kernels (Phase 2).
 #
-# What runs on OUR code: the DECODE main-attention (block-sparse paged flash-
-# decoding, page-128, ldmatrix W4=3) -- the bs1 interactive hot path -- via
-# forward_sparse_decode_serving (graph-capture safe). PREFILL attend + the whole
-# indexer (score+topk) stay on vLLM's Triton path (Phase 1).
+# What runs on OUR code:
+#   * DECODE main-attention (block-sparse paged flash-decoding, page-128,
+#     ldmatrix W4=3) -- the bs1 interactive hot path -- via
+#     forward_sparse_decode_serving (graph-capture safe).
+#   * PREFILL indexer TOP-K -- our SM120 topk_select_varlen (per-query num_valid,
+#     SET-EXACT vs Triton, 2-3x faster on the many-query prefill rows). Score
+#     stays Triton (byte-identical).
+# Still Triton (documented gaps -- see SERVING_INTEGRATION.md Phase 2):
+#   * DECODE indexer top-k (bs1 launch-bound -> fused Triton is faster there).
+#   * Indexer SCORE (needs a score-only paged pybind -- blocker D/E).
+#   * PREFILL main-attention (our paged kernel is page-64 / single-seq, not the
+#     fused page-128 cu_seqlens-batched cache).
 #
 # Mechanism: mount our overlay package + a sitecustomize.py startup hook that
-# (a) JIT-builds the decode kernel at startup and (b) monkeypatches
-# select_main_impl_cls to return MiniMaxM3SparseSm120Impl on capability-family
-# 120 + bf16 KV + topk16. The MoE/quant overlay is identical to launch_marlin.sh
-# so MoE perf is unchanged.
+# (a) JIT-builds the decode + topk kernels at startup and (b) monkeypatches
+# select_main_impl_cls -> MiniMaxM3SparseSm120Impl and select_indexer_impl_cls
+# -> MiniMaxM3IndexerSm120Impl on capability-family 120 + bf16 KV + topk16. The
+# MoE/quant overlay is identical to launch_marlin.sh so MoE perf is unchanged.
+#
+# Env knobs (read once at startup):
+#   SM120_INDEXER_DECODE=ours|triton  (default triton -- see Phase 2 verdict)
+#   SM120_INDEXER_PREFILL=ours|triton (default ours)
 #
 # To restore the marlin baseline instead:  /home/kacper/launch_marlin.sh graph
 set -euo pipefail

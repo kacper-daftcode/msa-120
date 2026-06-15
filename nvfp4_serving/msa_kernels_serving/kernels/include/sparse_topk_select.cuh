@@ -312,10 +312,17 @@ __device__ bool processHistogramStep(float const* logits, int rowEnd, uint32_t& 
 constexpr int kTransposeTile = 32;
 constexpr int kTransposeBlockRows = 8;
 
+// VARLEN extension: when `nv` (per-query num_valid, length qo, layout matching
+// the query index q) is non-null, the forced-block window (init [0,force_begin)
+// and local [nv[q]-force_end, nv[q])) is computed PER QUERY ROW from nv[q]
+// instead of the single scalar (force_end_start, num_valid_pages). `force_end`
+// is passed directly in that mode (force_end_start is ignored). This is what
+// makes the op set-exact vs the Triton per-query topk on a mixed-seq batch.
 __global__ void __launch_bounds__(kTransposeTile* kTransposeBlockRows)
     SparseTopKTransposeKernel(const float* __restrict__ in, float* __restrict__ out, uint32_t K,
                               uint32_t qo, uint32_t force_begin, uint32_t force_end_start,
-                              uint32_t num_valid_pages) {
+                              uint32_t num_valid_pages,
+                              const int32_t* __restrict__ nv, uint32_t force_end) {
   __shared__ float tile[kTransposeTile][kTransposeTile + 1];
 
   const uint32_t q_base = blockIdx.x * kTransposeTile;
@@ -338,12 +345,18 @@ __global__ void __launch_bounds__(kTransposeTile* kTransposeBlockRows)
   __syncthreads();
 
   const uint32_t k_store = k_base + tx;
-  const bool is_forced = (k_store < force_begin) ||
-                         (k_store >= force_end_start && k_store < num_valid_pages);
 #pragma unroll
   for (int dq = 0; dq < kTransposeTile; dq += kTransposeBlockRows) {
     const uint32_t q_store = q_base + ty + dq;
     if (q_store < qo && k_store < K) {
+      uint32_t fes = force_end_start, nvp = num_valid_pages;
+      if (nv != nullptr) {
+        const uint32_t row_nv = static_cast<uint32_t>(nv[q_store]);
+        nvp = row_nv;
+        fes = (force_end <= row_nv) ? row_nv - force_end : 0u;
+      }
+      const bool is_forced = (k_store < force_begin) ||
+                             (k_store >= fes && k_store < nvp);
       out_head[static_cast<size_t>(q_store) * K + k_store] = is_forced ? FLT_MAX : tile[tx][ty + dq];
     }
   }
@@ -376,7 +389,8 @@ __global__ void __launch_bounds__(kTransposeTile* kTransposeBlockRows)
 template <int TILE>
 __global__ void __launch_bounds__(TILE * TILE / 4) SparseTopKTransposeXorF4Kernel(
     const float* __restrict__ in, float* __restrict__ out, uint32_t K, uint32_t qo,
-    uint32_t force_begin, uint32_t force_end_start, uint32_t num_valid_pages) {
+    uint32_t force_begin, uint32_t force_end_start, uint32_t num_valid_pages,
+    const int32_t* __restrict__ nv, uint32_t force_end) {
   constexpr int N_THR = TILE / 4;  // threads along N (qo) direction
 
   __shared__ float S[TILE * TILE];
@@ -416,8 +430,14 @@ __global__ void __launch_bounds__(TILE * TILE / 4) SparseTopKTransposeXorF4Kerne
     float v2 = S[(tn * 4 + 2) * TILE + (tm ^ (tn * 4 + 2))];
     float v3 = S[(tn * 4 + 3) * TILE + (tm ^ (tn * 4 + 3))];
 
+    uint32_t fes = force_end_start, nvp = num_valid_pages;
+    if (nv != nullptr) {
+      const uint32_t row_nv = static_cast<uint32_t>(nv[q_out]);
+      nvp = row_nv;
+      fes = (force_end <= row_nv) ? row_nv - force_end : 0u;
+    }
     auto is_forced = [&](uint32_t k) -> bool {
-      return (k < force_begin) || (k >= force_end_start && k < num_valid_pages);
+      return (k < force_begin) || (k >= fes && k < nvp);
     };
     const uint32_t uk0 = static_cast<uint32_t>(k0);
     if (is_forced(uk0))     v0 = FLT_MAX;
@@ -444,7 +464,8 @@ __global__ void __launch_bounds__(TILE * TILE / 4) SparseTopKTransposeXorF4Kerne
 // max_k_tiles (or any value >= max_k_tiles) to disable clamping.
 __global__ void SparseTopKIdentityFillKernel(int32_t* __restrict__ out, uint32_t total_qo_len,
                                              uint32_t num_qo_heads, uint32_t max_k_tiles,
-                                             uint32_t topk, uint32_t num_valid_pages) {
+                                             uint32_t topk, uint32_t num_valid_pages,
+                                             const int32_t* __restrict__ nv) {
   // grid = (num_rows = total_qo_len * num_qo_heads,), block = (min(topk, 256),)
   // bid encodes (qo_head_idx, t) with t innermost: bid = qo_head_idx * total_qo_len + t
   // out physical layout: (total_qo_len, num_qo_heads, topk) row-major contiguous
@@ -455,7 +476,8 @@ __global__ void SparseTopKIdentityFillKernel(int32_t* __restrict__ out, uint32_t
   const uint32_t t = bid % total_qo_len;
   int32_t* row = out + (static_cast<size_t>(t) * num_qo_heads + qo_head_idx) * topk;
   // valid_count = min(max_k_tiles, num_valid_pages); positions [valid_count, topk) → -1
-  const uint32_t valid_count = (num_valid_pages < max_k_tiles) ? num_valid_pages : max_k_tiles;
+  const uint32_t row_nvp = (nv != nullptr) ? static_cast<uint32_t>(nv[t]) : num_valid_pages;
+  const uint32_t valid_count = (row_nvp < max_k_tiles) ? row_nvp : max_k_tiles;
   for (uint32_t i = tx; i < topk; i += blockDim.x) {
     row[i] = (i < valid_count) ? static_cast<int32_t>(i) : static_cast<int32_t>(-1);
   }
@@ -583,7 +605,10 @@ __global__ void __launch_bounds__(kIndexerNumThreadsPerBlock) IndexerTopKWithSor
     // and sorted to the tail.  Pass num_valid_pages = max_k_tiles to disable
     // (the comparison `idx >= num_valid_pages` will then never trigger because
     // every valid idx is in [0, max_k_tiles)).
-    uint32_t num_valid_pages) {
+    uint32_t num_valid_pages,
+    // VARLEN: per-query num_valid (length total_qo_len, indexed by query t).
+    // When non-null, overrides the scalar num_valid_pages for the OOB clamp.
+    const int32_t* __restrict__ nv) {
   static_assert(MAX_TOPK <= kSparseTopkMaxK, "MAX_TOPK exceeds supported max");
 
   constexpr int kNumThreadsPerBlock = kIndexerNumThreadsPerBlock;
@@ -621,6 +646,9 @@ __global__ void __launch_bounds__(kIndexerNumThreadsPerBlock) IndexerTopKWithSor
   const uint32_t bid = blockIdx.x;
   const uint32_t qo_head_idx = bid / total_qo_len;
   const uint32_t t = bid % total_qo_len;
+  // VARLEN: per-query effective OOB clamp bound (falls back to the scalar).
+  const uint32_t eff_num_valid =
+      (nv != nullptr) ? static_cast<uint32_t>(nv[t]) : num_valid_pages;
   // qo_outermost output offset:
   //   out (t, qo_head_idx, k) at offset (t*num_qo_heads + qo_head_idx) * topk + k
   const size_t row_offset_out =
@@ -639,7 +667,7 @@ __global__ void __launch_bounds__(kIndexerNumThreadsPerBlock) IndexerTopKWithSor
     int32_t* row_out = out + row_offset_out;
     // OOB clamp: indices >= num_valid_pages → -1
     const int valid_count =
-        (static_cast<int>(num_valid_pages) < rowLen) ? static_cast<int>(num_valid_pages) : rowLen;
+        (static_cast<int>(eff_num_valid) < rowLen) ? static_cast<int>(eff_num_valid) : rowLen;
     for (int rowIt = threadIdx.x; rowIt < valid_count; rowIt += kNumThreadsPerBlock) {
       row_out[rowIt] = rowIt;
     }
@@ -735,7 +763,7 @@ __global__ void __launch_bounds__(kIndexerNumThreadsPerBlock) IndexerTopKWithSor
     uint32_t key = ~0u;
     if (lane < topK) {
       const int32_t idx = smemOutput[lane];
-      const bool valid = (idx >= 0) && (static_cast<uint32_t>(idx) < num_valid_pages);
+      const bool valid = (idx >= 0) && (static_cast<uint32_t>(idx) < eff_num_valid);
       key = valid ? static_cast<uint32_t>(idx) : ~0u;
     }
     WarpBitonicSortAsc32(key, lane);
@@ -750,7 +778,7 @@ __global__ void __launch_bounds__(kIndexerNumThreadsPerBlock) IndexerTopKWithSor
       const int pos = static_cast<int>(lane) * 2 + s;
       if (pos < topK) {
         const int32_t idx = smemOutput[pos];
-        const bool valid = (idx >= 0) && (static_cast<uint32_t>(idx) < num_valid_pages);
+        const bool valid = (idx >= 0) && (static_cast<uint32_t>(idx) < eff_num_valid);
         keys[s] = valid ? static_cast<uint32_t>(idx) : ~0u;
       } else {
         keys[s] = ~0u;
@@ -777,7 +805,9 @@ cudaError_t LaunchTransposeAndIndexerTopK(const float* in_strided, float* transp
                                           uint32_t max_k_tiles, uint32_t topk,
                                           uint32_t num_valid_pages,
                                           uint32_t force_begin, uint32_t force_end_start,
-                                          cudaStream_t stream) {
+                                          cudaStream_t stream,
+                                          const int32_t* nv = nullptr,
+                                          uint32_t force_end = 0) {
   const uint32_t num_rows = total_qo_len * num_qo_heads;
   if (num_rows == 0) return cudaSuccess;
 
@@ -795,7 +825,7 @@ cudaError_t LaunchTransposeAndIndexerTopK(const float* in_strided, float* transp
       dim3 block(kXorTile * kXorTile / 4);  // = 256 threads
       void* tr_args[] = {(void*)&in_strided, (void*)&transposed, (void*)&max_k_tiles,
                          (void*)&total_qo_len, (void*)&force_begin, (void*)&force_end_start,
-                         (void*)&num_valid_pages};
+                         (void*)&num_valid_pages, (void*)&nv, (void*)&force_end};
       cudaError_t err = cudaLaunchKernel((const void*)SparseTopKTransposeXorF4Kernel<kXorTile>,
                                          grid, block, tr_args, 0, stream);
       if (err != cudaSuccess) return err;
@@ -805,7 +835,7 @@ cudaError_t LaunchTransposeAndIndexerTopK(const float* in_strided, float* transp
       dim3 block(kTransposeTile, kTransposeBlockRows);
       void* tr_args[] = {(void*)&in_strided, (void*)&transposed, (void*)&max_k_tiles,
                          (void*)&total_qo_len, (void*)&force_begin, (void*)&force_end_start,
-                         (void*)&num_valid_pages};
+                         (void*)&num_valid_pages, (void*)&nv, (void*)&force_end};
       cudaError_t err = cudaLaunchKernel((const void*)SparseTopKTransposeKernel, grid, block,
                                          tr_args, 0, stream);
       if (err != cudaSuccess) return err;
@@ -821,7 +851,7 @@ cudaError_t LaunchTransposeAndIndexerTopK(const float* in_strided, float* transp
     if (err != cudaSuccess) return err;
     void* args[] = {(void*)&transposed, (void*)&out, (void*)&total_qo_len,
                     (void*)&num_qo_heads, (void*)&max_k_tiles, (void*)&topk,
-                    (void*)&num_valid_pages};
+                    (void*)&num_valid_pages, (void*)&nv};
     dim3 grid(num_rows);
     dim3 block(kIndexerNumThreadsPerBlock);
     return cudaLaunchKernel((const void*)kernel, grid, block, args, dyn_smem_bytes, stream);
@@ -853,7 +883,12 @@ inline cudaError_t SparseTopKSelect(const float* in, int32_t* out, int32_t* work
                                     uint32_t total_qo_len, uint32_t num_qo_heads,
                                     uint32_t max_k_tiles, uint32_t num_valid_pages,
                                     uint32_t force_begin, uint32_t force_end,
-                                    cudaStream_t stream) {
+                                    cudaStream_t stream,
+                                    const int32_t* nv = nullptr) {
+  // VARLEN: when `nv` (per-query num_valid, length total_qo_len) is non-null,
+  // num_valid_pages / force_end are applied PER QUERY ROW (nv[t]) inside the
+  // kernels, making the op set-exact vs the Triton per-query topk on a mixed-
+  // seq decode/prefill batch. The scalar path (nv==nullptr) is unchanged.
   constexpr uint32_t topk = 16;
   const uint32_t num_rows = total_qo_len * num_qo_heads;
   if (num_rows == 0) return cudaSuccess;
@@ -863,7 +898,8 @@ inline cudaError_t SparseTopKSelect(const float* in, int32_t* out, int32_t* work
     dim3 grid(num_rows);
     dim3 block(topk);
     void* args[] = {(void*)&out, (void*)&total_qo_len, (void*)&num_qo_heads,
-                    (void*)&max_k_tiles, (void*)&topk, (void*)&num_valid_pages};
+                    (void*)&max_k_tiles, (void*)&topk, (void*)&num_valid_pages,
+                    (void*)&nv};
     return cudaLaunchKernel((const void*)SparseTopKIdentityFillKernel, grid, block, args, 0,
                             stream);
   }
@@ -877,7 +913,7 @@ inline cudaError_t SparseTopKSelect(const float* in, int32_t* out, int32_t* work
   float* transpose_buf = reinterpret_cast<float*>(workspace);
   return LaunchTransposeAndIndexerTopK(in, transpose_buf, out, total_qo_len, num_qo_heads,
                                        max_k_tiles, topk, num_valid_pages,
-                                       force_begin, force_end_start, stream);
+                                       force_begin, force_end_start, stream, nv, force_end);
 }
 
 }  // namespace sparse_topk

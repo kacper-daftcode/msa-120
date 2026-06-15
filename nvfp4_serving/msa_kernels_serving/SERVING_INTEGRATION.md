@@ -285,3 +285,136 @@ docker exec msa-verify /opt/ncu/ncu --kernel-name regex:partial_p128_ldsm \
 bash msa_kernels_serving/launch_msa.sh graph   # ours; or  /home/kacper/launch_marlin.sh graph
 python3 bench/bench_client.py --decode-reqs 16 --output-len 200 ...                  # decode bs1
 ```
+
+---
+
+## Phase 2 — our indexer TOP-K onto OUR code (2026-06-15, SHIPPED)
+
+User accepted the -3.1 % decode-attend regression to "have it all ours"; the
+floor is now Phase-1 (our decode-attend), and the goal is the MAXIMAL coherent,
+graph-capture-safe "our code" config above that floor. Phase 2 lands **our
+SM120 top-k on the PREFILL indexer path** and ships it; the other Phase-2
+candidates (decode-topk, prefill-attend, indexer-score) are documented gaps with
+the exact code-level blocker.
+
+### Per-op table (what runs on OUR code vs Triton, and why)
+
+| MSA op | impl | why |
+| --- | --- | --- |
+| DECODE main-attend (bs1 hot path) | **OURS** (`forward_sparse_decode_serving`) | Phase-1; page-128 fused-cache flash-decoding, graph-safe. |
+| PREFILL indexer TOP-K | **OURS** (`topk_select_varlen`) | NEW; per-query num_valid -> SET-EXACT vs Triton + 2-3x faster on the many-query prefill rows. Score stays Triton (byte-identical). |
+| DECODE indexer top-k | Triton (`minimax_m3_index_decode`, fused) | Our topk op is 2.5x faster standalone (21 vs 53 us @ bs1), BUT at bs1 the per-token step is launch-bound; the extra per-layer host ops to feed our topk (score buffer alloc + transpose + permute, x57 layers, captured into the graph) cost more than the op saves -> wiring our decode-topk measured **-6 %** (82.9 vs 88.9). Fused Triton wins at bs1. (Re-enable with `SM120_INDEXER_DECODE=ours`.) |
+| Indexer SCORE (decode & prefill) | Triton (`minimax_m3_index_*score`) | Our `block_scores` pybind is the FULL project+norm+rope pipeline from hidden states reading a DENSE index-K; vLLM's `idx_q` is pre-projected/roped and index-K is PAGED `[num_blocks,128,128]`. A score-only paged pybind (`index_block_scores`, blocker D/E) was not landed in the slot -> Triton score kept (byte-identical; our topk consumes it directly). |
+| PREFILL main-attend | Triton (`minimax_m3_sparse_attn`) | Our `forward_sparse_paged` is PAGE_SIZE=64 with SEPARATE k/v page pools + a single host `seq_len_k`; the live cache is the FUSED page-128 `[num_blocks,2,128,Hkv,128]` with cu_seqlens-batched variable-length requests. Not a drop-in; the serving decode kernel is query_len==1 specialized. |
+| MoE | marlin NVFP4 fused | unchanged from baseline. |
+
+### The kernel that landed: `topk_select_varlen` (per-query num_valid)
+
+The shipped scalar `topk_select(max_score, num_valid_pages, fb, fe)` applies
+`num_valid_pages` and the local-block force window `[num_valid-fe, num_valid)`
+UNIFORMLY to every (head,query) row. That is set-exact only when every query in
+the batch shares one causal length. **Empirically it DIVERGES on a real mixed-
+seq decode batch: 1/8 set-match** (`test_topk_mixed_decode.py`) -- short requests
+over-select garbage blocks, long ones pick the global-num_valid boundary block.
+A scalar cannot express M3's `local_blocks=1` (each query's local block is ITS
+OWN last valid block, which differs per request). Wiring the scalar topk into
+serving would have produced INCOHERENT output, not just slow.
+
+Fix (contained to `sparse_topk_select.cuh` + `sm120_sparse_topk.cu`, the existing
+scalar path untouched): a new entrypoint `topk_select_varlen(max_score,
+num_valid[Q] int32, fb, fe)` that threads a per-query device `nv[]` through the
+two transpose kernels, the indexer-topk warp-sort clamp, and the identity-fill
+kernel. Each query's force window + OOB clamp use `nv[q]` (the query index is
+already in-hand: `q_store`/`q_out` in the transposes, `t` in the topk kernel).
+Caller pre-fills score slots beyond each query's causal range with `-inf` so
+non-forced out-of-range blocks never out-score real ones.
+
+### Correctness (THE hard gate -- topk = wrong selection -> incoherent serving)
+
+- `topk_select_varlen` vs the fused Triton `minimax_m3_index_decode` on a MIXED
+  decode batch: **8/8 SET-EXACT** (scalar was 1/8). Stress grid
+  (`test_topk_mixed_decode.py stress`): **24/24 ALL SET-EXACT** across mixed /
+  single / uniform / trivial(<=16 blk) / local=2 / init=1 / 4-head / tiny-mix.
+- PREFILL: `minimax_m3_index_score` + our varlen topk vs Triton
+  `minimax_m3_index_score`+`minimax_m3_index_topk`
+  (`test_prefill_topk.py`): **ALL SET-EXACT** across chunked-prefill, cached
+  context, single-long (4096 rows), mixed-ctx, local=2, init=1 (thousands of
+  query rows/case).
+- The PUBLIC score reuse is verified identical to the fused decode score
+  (`test_score_decode_via_prefill.py`: 8/8 SET-EXACT).
+- The scalar `topk_select` op-equivalence vs Triton is **unchanged** (still ALL
+  MATCH) -- the new param is additive, the scalar path byte-identical.
+
+### Graph-capture (THE #1 gate) -- PASSED
+
+Live `launch_msa.sh graph` startup:
+- `select_indexer_impl_cls -> MiniMaxM3IndexerSm120Impl (...; topk=ours/varlen,
+  score=Triton)` x **228** (57 sparse layers x 4 TP workers) -- every layer's
+  indexer on our path; `select_main_impl_cls -> MiniMaxM3SparseSm120Impl` x228.
+- `topk (varlen) kernel JIT-built at startup (graph-safe)` (x4 workers + API).
+- `Capturing CUDA graphs (decode, FULL): 100% 51/51`, **0 StreamCaptureInvalidated**,
+  `Graph capturing finished in 16 secs, took 3.26 GiB` (= Phase-1).
+The prefill-topk path adds only static-shape device ops (arange/sub/masked_fill/
+searchsorted) + one allocation-free custom op; no host `.item()`/sync.
+
+### Coherence -- PASSED
+
+"capital of Poland" -> **Warsaw**; "17 x 23" -> **391**; one-liner ->
+`sum(i**2 for i in range(1, n+1))`. No garbling.
+
+### Serving throughput (this box, 2026-06-15, identical methodology)
+
+Fresh A/B, same session. Decode bs1 = clean decode-only 12-16 reqs x 200 tok,
+3-run median. Prefill = 4100-tok UNIQUE prompt (cache-cold; the default fixed
+512-prompt prefix-cache-hits and is not representative).
+
+| metric | marlin baseline | ours-MSA (Phase 2) | delta |
+|---|---:|---:|---:|
+| decode bs1 tok/s (3-run median) | **92.05** | 88.9 | **-3.4 %** |
+| clean prefill tok/s (4100-tok) | 7550 | 7478 | -1.0 % (neutral) |
+| sweep c=1 out tok/s | 88.05* | 87.32 | ~flat |
+| sweep c=16 out tok/s | (Phase-1 722) | 751 | +4 %~noise |
+
+(*Phase-1 marlin sweep figure; the Phase-2 decode/sweep numbers are within the
+~2 % run-to-run window of the Phase-1 -3.1 % floor.) Diagnostic micro-bench at
+bs1 (eager): our score+varlen-topk = **21 us** vs fused Triton decode = **53 us**
+(2.5x) -- the indexer op IS faster; the decode-topk-in-graph regression is purely
+the per-layer host-op launch overhead at bs1, which is why decode-topk is left
+Triton and only PREFILL topk ships ours.
+
+### Verdict -- how much of MSA is now ours, and the net
+
+**SHIPPED (final box state): `launch_msa.sh graph`.** Our code now runs the
+DECODE main-attend (Phase-1) AND the PREFILL indexer top-k (Phase-2, set-exact +
+faster), both graph-capture-safe and coherent. Net decode bs1 = **88.9 vs 92.05
+marlin (-3.4 %)** -- the SAME accepted -3.1 % floor as Phase-1 (the prefill-topk
+swap is decode-neutral; prefill neutral at -1 %). So Phase 2 strictly ADDS our-
+code coverage (prefill topk) WITHOUT regressing below the floor.
+
+Honest gap accounting (kept Triton, with the real blocker):
+- **decode indexer top-k** -- our op is 2.5x faster but bs1 is launch-bound; the
+  feed overhead nets -6 %. Right call: fused Triton at bs1. (Flag-toggleable.)
+- **indexer score** -- needs the score-only paged pybind (`index_block_scores`,
+  blocker D/E); the full `block_scores` does projection from hidden states +
+  dense index-K, not the M3 pre-projected/paged contract. Not landed.
+- **prefill main-attend** -- our paged kernel is page-64/single-seq, not the
+  fused page-128 cu_seqlens-batched cache; the decode kernel is query_len==1
+  specialized. Needs a new prefill-attend kernel over the fused cache.
+
+Net: of the four swappable MSA ops, **2 run on our code** (decode-attend,
+prefill-topk); the decode-attend is the throughput-deciding one and is the
+accepted -3.1/-3.4 % path. This is the maximal coherent, graph-safe our-code
+config above the Phase-1 floor.
+
+### Reproduce (Phase 2)
+```
+# kernel correctness (in serving container, GPU0, tiny alloc):
+docker exec minimax-m3-nvfp4 python3 /opt/sm120/msa_kernels_serving/test_topk_mixed_decode.py stress  # 24/24 SET-EXACT
+docker exec minimax-m3-nvfp4 python3 /opt/sm120/msa_kernels_serving/test_prefill_topk.py              # ALL SET-EXACT
+docker exec minimax-m3-nvfp4 python3 /opt/sm120/msa_kernels_serving/op_equivalence_topk.py \
+    --csrc /opt/sm120/msa_kernels_serving/kernels                                                     # scalar still ALL MATCH
+# end-to-end (ships prefill-topk ours, decode-topk Triton):
+bash msa_kernels_serving/launch_msa.sh graph
+python3 bench/bench_client.py --decode-reqs 16 --output-len 200    # decode bs1 ~88.9
+python3 bench/bench_client.py --input-len 4096 --prefill-reps 5 --seed $RANDOM --conditions prefill  # clean prefill
+```

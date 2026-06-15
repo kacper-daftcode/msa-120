@@ -23,6 +23,10 @@ from vllm.models.minimax_m3.common.sparse_attention import (  # type: ignore
     MiniMaxM3SparseImpl,
     select_main_impl_cls as _orig_select_main,
 )
+from vllm.models.minimax_m3.common.indexer import (  # type: ignore
+    MiniMaxM3IndexerImpl,
+    select_indexer_impl_cls as _orig_select_indexer,
+)
 
 
 def patched_select_main_impl_cls(
@@ -42,8 +46,29 @@ def patched_select_main_impl_cls(
     return _orig_select_main(topk_blocks=topk_blocks, kv_cache_dtype=kv_cache_dtype)
 
 
+def patched_select_indexer_impl_cls(
+    *, indexer_kv_dtype: str = "bf16"
+) -> "type[MiniMaxM3IndexerImpl]":
+    """Route the bf16 indexer top-k onto our SM120 varlen kernel (family120).
+
+    Score stays Triton (byte-identical), only the top-k op is swapped -- see
+    sm120_indexer_impl.py. Falls back to Triton on any non-matching config.
+    """
+    if (
+        current_platform.is_cuda()
+        and current_platform.is_device_capability_family(120)
+        and indexer_kv_dtype == "bf16"
+    ):
+        from .sm120_indexer_impl import MiniMaxM3IndexerSm120Impl
+
+        print("[sm120-msa] select_indexer_impl_cls -> MiniMaxM3IndexerSm120Impl "
+              "(family120, bf16; topk=ours/varlen, score=Triton)", flush=True)
+        return MiniMaxM3IndexerSm120Impl
+    return _orig_select_indexer(indexer_kv_dtype=indexer_kv_dtype)
+
+
 def apply() -> None:
-    """Rebind ``select_main_impl_cls`` everywhere it is referenced. Idempotent."""
+    """Rebind the impl selectors everywhere they are referenced. Idempotent."""
     import vllm.models.minimax_m3.common.sparse_attention as sa  # type: ignore
 
     sa.select_main_impl_cls = patched_select_main_impl_cls
@@ -57,17 +82,31 @@ def apply() -> None:
     except Exception as e:  # pragma: no cover
         print(f"[sm120-msa] WARNING: could not patch nvidia.model: {e!r}", flush=True)
 
-    # Pre-build the JIT kernel NOW (startup), so the first decode -- which may
+    # Indexer top-k -> our SM120 varlen kernel (score stays Triton). The name is
+    # called from MiniMaxM3Indexer.__init__ in the same module, so rebinding the
+    # source module is sufficient (model.py does not import it).
+    try:
+        import vllm.models.minimax_m3.common.indexer as ix  # type: ignore
+
+        ix.select_indexer_impl_cls = patched_select_indexer_impl_cls
+    except Exception as e:  # pragma: no cover
+        print(f"[sm120-msa] WARNING: could not patch indexer selector: {e!r}",
+              flush=True)
+
+    # Pre-build the JIT kernels NOW (startup), so the first forward -- which may
     # occur during CUDA-graph capture/warmup -- never triggers a cpp_extension
     # compile inside a graph-capture region.
     try:
-        from ._loader import decode_serving_ext
+        from ._loader import decode_serving_ext, topk_ext
 
         decode_serving_ext()
         print("[sm120-msa] decode kernel JIT-built at startup (graph-safe)",
+              flush=True)
+        topk_ext()
+        print("[sm120-msa] topk (varlen) kernel JIT-built at startup (graph-safe)",
               flush=True)
     except Exception as e:  # pragma: no cover
         print(f"[sm120-msa] WARNING: kernel pre-build failed: {e!r}", flush=True)
 
     print("[sm120-msa] selector patch applied (main attend -> SM120 decode; "
-          "indexer stays Triton)", flush=True)
+          "indexer top-k -> SM120 varlen, score -> Triton)", flush=True)

@@ -1,221 +1,255 @@
 # SPDX-License-Identifier: MIT
-"""SM120 lightning-indexer impl for MiniMax-M3 (DRAFT).
+"""SM120 lightning-indexer impl for MiniMax-M3 (LIVE serving, Phase 2).
 
-Mirrors ``MiniMaxM3IndexerTritonImpl.forward``
-(vllm/models/minimax_m3/common/indexer.py:375-433) but routes scoring + top-k
-through our SM120 kernels:
+Routes the indexer TOP-K selection onto our SM120 ``topk_select_varlen`` kernel
+(per-query num_valid -> SET-EXACT vs the Triton per-query topk, 2-3x faster),
+while keeping the Triton SCORE kernels byte-identical. The score is the
+projection-free, paged, causal block-max-pool that the fused
+``minimax_m3_index_decode`` / ``minimax_m3_index_score`` already compute; we
+reuse those EXACT Triton score launches and only swap the top-k op.
 
-  * score (prefill & decode) -> ``sm120_indexer`` block-score path
-  * top-k                    -> ``sm120_sparse_topk.topk_select``
+Why only topk (not the score kernel): vLLM's ``idx_q`` is pre-projected / normed
+/ roped and index-K is paged ``[num_blocks,128,head_dim]`` via block_table. Our
+standalone indexer score kernel does the full projection from hidden states and
+reads a dense (non-paged) index-K, so it is NOT a drop-in for this contract
+(blocker D/E). The top-k, by contrast, consumes the score tensor directly and is
+where our kernel WINS, so Phase 2 swaps exactly that.
 
-The Triton impl calls, for decode, the fused ``minimax_m3_index_decode``
-(score+topk, index_topk.py:746) and, for prefill, ``minimax_m3_index_score``
-(index_topk.py:641) then ``minimax_m3_index_topk`` (index_topk.py:702). We split
-both phases into a score op + our topk_select.
+GRAPH-CAPTURE SAFE: the decode branch reuses the same split-K decode-score
+launch (already captured into the FULL decode cudagraph by the Triton impl) and
+adds only static-shape device ops (arange, sub, masked_fill) + one allocation-
+free custom op. No host ``.item()`` / no host sync in the captured region.
 
-KEY CONTRACT NOTE (M8 doc, index_topk.py:642-657):
-``idx_q`` is ALREADY projected / normed / roped upstream. So we need only the
-SCORE+MAXPOOL half of our ``sm120_indexer`` kernel (``block_score_hmma``,
-sm120_indexer.cu:337), NOT its full projection pipeline. BUT: our only pybind
-entrypoint, ``block_scores`` (sm120_indexer.cu:736), is the FULL pipeline taking
-hidden states + projection weights — there is no score-only pybind today. So
-this impl is blocked on exposing ``block_score_hmma`` as its own entrypoint
-(e.g. ``index_block_scores(q_idx[N,H,128], k_idx[N,128], positions, ...)``).
-The call below targets that NOT-YET-EXISTING entrypoint and is marked clearly.
-
-!!! Code DRAFT — will not run until the score-only entrypoint exists and the
-    paged/dense index-K layout is reconciled (see README.md). !!!
+CORRECTNESS: ``topk_select_varlen`` is proven SET-EXACT vs the fused Triton
+decode topk across a mixed-seq stress grid (see test_topk_mixed_decode.py
+``stress`` -> ALL SET-EXACT, 24 cases). The score reuse is verified identical
+(test_topk_mixed_decode.py / test_score_decode_via_prefill.py).
 """
 
 from __future__ import annotations
 
+import os
+
 import torch
 
 from vllm.forward_context import get_forward_context  # type: ignore
+from vllm.platforms import current_platform  # type: ignore
 from vllm.models.minimax_m3.common.indexer import (  # type: ignore
     MiniMaxM3IndexerImpl,
     MiniMaxM3IndexerMetadata,
 )
+from vllm.models.minimax_m3.common.ops.index_topk import (  # type: ignore
+    SPARSE_BLOCK_SIZE,
+    minimax_m3_index_score,
+    minimax_m3_index_decode,
+    _decode_index_score_kernel,
+)
+from vllm.utils.math_utils import round_up  # type: ignore
 
-from ._loader import indexer_ext, topk_ext
+from ._loader import topk_ext
 
-# Our topk_select hard-codes topk == 16 (sm120_sparse_topk.cu:24). M3's
-# topk_blocks is configurable; assert it matches at build/select time.
+# Our topk_select is fixed at topk == 16 (sm120_sparse_topk.cu).
 SM120_TOPK = 16
+
+# Which phases run our varlen topk. Default: prefill only (decode bs1 is launch-
+# bound -- the fused Triton decode is already cheap there and our extra per-layer
+# host ops cost more than the op saves; prefill is many query rows where our
+# 2-3x faster topk dominates). Override via SM120_INDEXER_DECODE=ours to also
+# swap decode (measured slower at bs1 -- see SERVING_INTEGRATION.md Phase 2).
+_DECODE_OURS = os.environ.get("SM120_INDEXER_DECODE", "triton").lower() == "ours"
+_PREFILL_OURS = os.environ.get("SM120_INDEXER_PREFILL", "ours").lower() == "ours"
 
 
 class MiniMaxM3IndexerSm120Impl(MiniMaxM3IndexerImpl):
-    """Indexer score + top-k on SM120.
+    """Indexer top-k on SM120 (our varlen kernel); score stays Triton.
 
-    __init__ inherited from the base (indexer.py:328): owns the side cache via
-    ``self.index_cache``; ``indexer_backend_cls`` left as the base
-    ``MiniMaxM3IndexerBackend`` (its cache shape [num_blocks,128,head_dim],
-    indexer.py:95, is what our score path needs to read).
+    Mirrors ``MiniMaxM3IndexerTritonImpl.forward`` but replaces the top-k op:
+      * decode  : reuse the split-K decode SCORE launch, then our varlen topk.
+      * prefill : reuse ``minimax_m3_index_score``, then our varlen topk.
     """
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self._tk = None
+
+    def _topk(self):
+        if self._tk is None:
+            self._tk = topk_ext()
+        return self._tk
 
     def forward(
         self,
         index_query: torch.Tensor,
     ) -> "tuple[torch.Tensor | None, torch.Tensor | None]":
-        # ---- mirror of MiniMaxM3IndexerTritonImpl.forward (indexer.py:380) ----
         attn_metadata = get_forward_context().attn_metadata
         if not isinstance(attn_metadata, dict):
-            return None, None  # profiling run (indexer.py:381)
+            return None, None  # profiling run; caches unbound
         index_md: MiniMaxM3IndexerMetadata = attn_metadata[self.index_cache.prefix]
         assert isinstance(index_md, MiniMaxM3IndexerMetadata)
 
         num_tokens = index_md.num_actual_tokens
         nd = index_md.num_decode_tokens
-        # idx_q: [total_q, num_index_heads, index_head_dim==128] (indexer.py:386)
         iq = index_query[:num_tokens].view(
             -1, self.num_index_heads, self.index_head_dim
         )
-        kv = self.index_cache.kv_cache  # [num_blocks, 128, head_dim] (indexer.py:95)
+        kv = self.index_cache.kv_cache  # [num_blocks, 128, head_dim]
 
         decode_topk: torch.Tensor | None = None
         prefill_topk: torch.Tensor | None = None
-
-        if index_md.num_decodes > 0:
-            d = index_md.decode
-            assert d is not None
-            decode_topk = self._score_and_topk(
-                iq[:nd],
-                kv,
-                block_table=d.block_table,
-                seq_lens=d.seq_lens,
-                # decode: each query token's KV length = its own position+1;
-                # the score kernel reconstructs it from seq_lens/decode_query_len.
-                cu_seqlens_q=None,
-                prefix_lens=None,
-                max_query_len=d.decode_query_len,
-                max_seq_len=d.max_seq_len,
-                decode_query_len=d.decode_query_len,
-            )
-
-        if index_md.num_prefills > 0:
-            p = index_md.prefill
-            assert p is not None
-            prefill_topk = self._score_and_topk(
-                iq[nd:],
-                kv,
-                block_table=p.block_table,
-                seq_lens=p.seq_lens,
-                cu_seqlens_q=p.cu_seqlens_q,     # [num_prefills+1] int32, rebased
-                prefix_lens=p.context_lens,      # [num_prefills] int32
-                max_query_len=p.max_query_len,
-                max_seq_len=p.max_seq_len,
-                decode_query_len=None,
-            )
-
-        return decode_topk, prefill_topk
-
-    # ------------------------------------------------------------------
-    def _score_and_topk(
-        self,
-        idx_q: torch.Tensor,             # [total_q, num_idx_heads, 128]
-        index_kv_cache: torch.Tensor,    # [num_blocks, 128, head_dim]
-        *,
-        block_table: torch.Tensor,       # [num_reqs, max_blocks] int32
-        seq_lens: torch.Tensor,          # [num_reqs] int32
-        cu_seqlens_q: "torch.Tensor | None",
-        prefix_lens: "torch.Tensor | None",
-        max_query_len: int,
-        max_seq_len: int,
-        decode_query_len: "int | None",
-    ) -> torch.Tensor:
-        """Score every visible 128-block, max-pool, then top-k.
-
-        vLLM op contract (index_topk.py):
-          score = minimax_m3_index_score(...) -> [num_idx_heads, total_q, max_block]
-          topk  = minimax_m3_index_topk(score, ...) -> [num_idx_heads, total_q, topk]
-
-        Our ops:
-          max_score = sm120_indexer.<index_block_scores>(...) -> [H, nblk, total_q]
-              (block_score_hmma output, sm120_indexer.cu:341,690 -> [H,nblk,N])
-          out = sm120_sparse_topk.topk_select(max_score[H,K,Q], num_valid,
-                    force_begin, force_end) -> [total_q, H, 16]
-              (sm120_sparse_topk.cu:14-40)
-
-        IMPORTANT LAYOUT MATCH: our topk_select wants max_score as [H, K, Q]
-        which is EXACTLY our indexer's [H, nblk, total_q] output — they compose
-        with no transpose. But vLLM's score op produces [H, total_q, max_block]
-        (axes 1<->2 swapped) — so we deliberately keep OUR [H, nblk, total_q]
-        layout end-to-end and never materialize vLLM's score layout.
-
-        topk_select returns [total_q, H, 16]; vLLM consumers
-        (sparse_attn.py:444 t_ptr) want [num_kv_heads, total_q, topk]. So we
-        permute(1, 0, 2) -> [H, total_q, 16] before returning. (H == num_idx_heads
-        == num_kv_heads for M3, index_topk.py:659.)
-        """
-        idx = indexer_ext()
-        tk = topk_ext()
-
-        # ---- SCORE ----
-        # !!! BLOCKED: needs a score-only entrypoint exposing block_score_hmma.
-        #     The existing `block_scores` (sm120_indexer.cu:736) is the FULL
-        #     project+norm+rope+score pipeline from hidden states + weights, which
-        #     is NOT what we want (idx_q is pre-projected). Pseudocall to the
-        #     intended new entrypoint:
-        #
-        #         max_score = idx.index_block_scores(
-        #             idx_q,                 # [total_q, H, 128] bf16 (pre-roped)
-        #             index_kv_cache,        # paged index-K [num_blocks,128,128]
-        #             block_table, seq_lens,
-        #             cu_seqlens_q, prefix_lens,
-        #             self.block_size,       # sparse block size == 128
-        #             self.scale, causal=True,
-        #         )  # -> [H, nblk, total_q] fp32
-        #
-        # Until that exists, raise so nobody silently runs the wrong (projection)
-        # kernel. The full `block_scores` is NOT a drop-in: it also needs the
-        # paged index-K layout (our standalone kernel is dense [N,128], vLLM's is
-        # paged [num_blocks,128,128] via block_table) — flagged in README.
-        if not hasattr(idx, "index_block_scores"):
-            raise NotImplementedError(
-                "sm120_indexer needs a score-only paged entrypoint "
-                "(index_block_scores). The full `block_scores` pipeline does "
-                "projection from hidden states and reads a dense (non-paged) "
-                "index-K, neither of which matches the M3 indexer op contract. "
-                "See vllm_integration/README.md."
-            )
-        max_score = idx.index_block_scores(  # pragma: no cover (entrypoint TBD)
-            idx_q,
-            index_kv_cache,
-            block_table,
-            seq_lens,
-            cu_seqlens_q,
-            prefix_lens,
-            int(self.block_size),
-            float(self.scale),
-            True,  # causal
-        )  # [H, nblk, total_q] fp32, contiguous
-
-        # ---- TOP-K ----
-        # num_valid: number of real KV blocks for the longest sequence; the
-        # kernel clamps per-row by num_valid (block ids >= num_valid -> -1).
-        # For mixed prefill, num_valid is per-query, but our topk_select takes a
-        # single scalar; pass the global max-block count and rely on -inf score
-        # rows being masked by the score kernel's causal fill (DRAFT: verify the
-        # per-query causal masking actually lands in max_score, else this
-        # over-selects future blocks).
-        num_valid = max_score.shape[1]  # nblk
-
-        # force_begin/force_end == init_blocks/local_blocks (M8 doc line 52).
-        force_begin = int(self.init_blocks)
-        force_end = int(self.local_blocks)
 
         assert self.topk_blocks == SM120_TOPK, (
             f"sm120 topk_select is fixed at {SM120_TOPK}; "
             f"model topk_blocks={self.topk_blocks}"
         )
-        topk_qh16 = tk.topk_select(
-            max_score.contiguous(),
-            num_valid,
-            force_begin,
-            force_end,
-        )  # [total_q, H, 16] int32, ascending block ids, -1 pad
 
-        # -> [num_kv_heads(H), total_q, topk] to match the attend's t_ptr layout
-        # (sparse_attn.py:444). decode_query_len unused here (per-token rows
-        # already flattened into total_q).
-        return topk_qh16.permute(1, 0, 2).contiguous()
+        if index_md.num_decodes > 0:
+            d = index_md.decode
+            assert d is not None
+            if _DECODE_OURS:
+                decode_topk = self._decode_topk(
+                    iq[:nd], kv, d.block_table, d.seq_lens,
+                    d.max_seq_len, d.decode_query_len,
+                )
+            else:
+                decode_topk = minimax_m3_index_decode(
+                    iq[:nd], kv, d.block_table, d.seq_lens, d.max_seq_len,
+                    self.topk_blocks, self.init_blocks, self.local_blocks,
+                    self.num_kv_heads, self.scale, d.decode_query_len,
+                )
+
+        if index_md.num_prefills > 0:
+            p = index_md.prefill
+            assert p is not None
+            if _PREFILL_OURS:
+                prefill_topk = self._prefill_topk(
+                    iq[nd:], kv, p.block_table, p.cu_seqlens_q,
+                    p.seq_lens, p.context_lens, p.max_query_len, p.max_seq_len,
+                )
+            else:
+                from vllm.models.minimax_m3.common.ops.index_topk import (  # type: ignore
+                    minimax_m3_index_topk,
+                )
+                score = minimax_m3_index_score(
+                    iq[nd:], kv, p.block_table, p.cu_seqlens_q, p.seq_lens,
+                    p.context_lens, p.max_query_len, p.max_seq_len,
+                    self.num_kv_heads, self.scale,
+                )
+                prefill_topk = minimax_m3_index_topk(
+                    score, p.cu_seqlens_q, p.context_lens, p.max_query_len,
+                    self.topk_blocks, self.init_blocks, self.local_blocks,
+                )
+
+        return decode_topk, prefill_topk
+
+    # ------------------------------------------------------------------
+    def _run_varlen_topk(self, score_hqk, num_valid_q):
+        """score_hqk [H, total_q, Kstride] fp32 (out-of-range == -inf),
+        num_valid_q [total_q] int32 -> topk [H, total_q, 16] (attend t_ptr)."""
+        # our topk wants [H, K, Q]; transpose. (contiguous: the transpose kernel
+        # reads a [H,K,Q] row-contiguous buffer.)
+        max_score = score_hqk.permute(0, 2, 1).contiguous()  # [H, K, total_q]
+        out = self._topk().topk_select_varlen(
+            max_score,
+            num_valid_q.to(torch.int32).contiguous(),
+            int(self.init_blocks),
+            int(self.local_blocks),
+        )  # [total_q, H, 16] int32, asc block ids, -1 pad
+        # -> [num_kv_heads(H), total_q, topk] (sparse_attn.py t_ptr layout).
+        return out.permute(1, 0, 2).contiguous()
+
+    def _decode_topk(self, idx_q, kv, block_table, seq_lens,
+                     max_seq_len, decode_query_len):
+        """Reuse the fused-decode SPLIT-K score launch, then our varlen topk.
+
+        idx_q: [total_q, H, 128]; total_q == num_decodes * decode_query_len.
+        """
+        total_q, H, head_dim = idx_q.shape
+        max_block = (max_seq_len + SPARSE_BLOCK_SIZE - 1) // SPARSE_BLOCK_SIZE
+        score_block_stride = round_up(max_block, 16)
+        # -inf init so blocks the score kernel does NOT write (beyond each
+        # query's causal range) are never selected over real blocks.
+        score = torch.full(
+            (H, total_q, score_block_stride), float("-inf"),
+            dtype=torch.float32, device=idx_q.device,
+        )
+        use_pdl = current_platform.is_arch_support_pdl()
+        pdl = {"launch_pdl": True} if use_pdl else {}
+        TARGET_GRID, MAX_NUM_KV_CHUNKS = 4096, 256
+        target = max(1, min(MAX_NUM_KV_CHUNKS, TARGET_GRID // max(1, total_q * H)))
+        num_kv_chunks = 1 << (target.bit_length() - 1)
+        _decode_index_score_kernel[(total_q, num_kv_chunks)](
+            idx_q, kv, score, block_table, seq_lens,
+            H, head_dim, int(self.init_blocks), int(self.local_blocks),
+            self.scale, decode_query_len,
+            idx_q.stride(0), idx_q.stride(1), idx_q.stride(2),
+            kv.stride(0), kv.stride(1), kv.stride(2),
+            score.stride(0), score.stride(1), score.stride(2),
+            block_table.stride(0),
+            BLOCK_SIZE_K=SPARSE_BLOCK_SIZE, num_kv_chunks=num_kv_chunks,
+            USE_PDL=use_pdl, **pdl,
+        )
+        # per-query num_valid = ceil(kv_len/128). For decode_query_len q-slots per
+        # request, query slot j sees kv_len = seq_len - decode_query_len + j + 1.
+        nv = self._decode_num_valid(seq_lens, decode_query_len, total_q)
+        return self._run_varlen_topk(score, nv)
+
+    @staticmethod
+    def _decode_num_valid(seq_lens, decode_query_len, total_q):
+        """num_valid[total_q] = ceil(kv_len/128), request-major flatten.
+
+        kv_len for request r, query slot j (0..qlen-1) =
+            seq_lens[r] - decode_query_len + j + 1.
+        For qlen==1 this is simply ceil(seq_lens/128). Static-shape, device-only.
+        """
+        BS = SPARSE_BLOCK_SIZE
+        if decode_query_len == 1:
+            kv_len = seq_lens
+        else:
+            r = seq_lens.view(-1, 1)  # [R,1]
+            j = torch.arange(decode_query_len, device=seq_lens.device).view(1, -1)
+            kv_len = (r - decode_query_len + j + 1).reshape(-1)  # [R*qlen]
+        kv_len = kv_len.clamp_min(0)
+        return (kv_len + BS - 1) // BS  # [total_q]
+
+    def _prefill_topk(self, idx_q, kv, block_table, cu_seqlens_q,
+                      seq_lens, context_lens, max_query_len, max_seq_len):
+        """Reuse minimax_m3_index_score, then our varlen topk (per-query causal).
+
+        idx_q: [total_q, H, 128]. Score op leaves out-of-range slots unwritten;
+        we -inf them per query before topk.
+        """
+        H = idx_q.shape[1]
+        score = minimax_m3_index_score(
+            idx_q, kv, block_table, cu_seqlens_q, seq_lens, context_lens,
+            max_query_len, max_seq_len, H, self.scale,
+        )  # [H, total_q, score_block_stride] (out-of-range slots = garbage)
+
+        nv = self._prefill_num_valid(cu_seqlens_q, context_lens, idx_q.shape[0])
+        # -inf out-of-range slots: block k is valid for query q iff k < nv[q].
+        Kdim = score.shape[2]
+        kidx = torch.arange(Kdim, device=score.device).view(1, 1, -1)
+        mask = kidx >= nv.view(1, -1, 1)  # [1, total_q, Kdim]
+        score = score.masked_fill(mask, float("-inf"))
+        return self._run_varlen_topk(score, nv)
+
+    @staticmethod
+    def _prefill_num_valid(cu_seqlens_q, context_lens, total_q):
+        """num_valid[total_q] = ceil(kv_len/128) per prefill query token.
+
+        For request r with context_lens[r] cached tokens, the j-th query token
+        (j in [0, query_len_r)) has kv_len = context_lens[r] + j + 1. We build
+        this from cu_seqlens_q (per-request query spans), all on device.
+        Static-shape within a captured graph (total_q fixed).
+        """
+        BS = SPARSE_BLOCK_SIZE
+        dev = cu_seqlens_q.device
+        # position of each flattened query token within its request:
+        #   local_j[t] = t - cu_seqlens_q[req(t)]
+        # req(t) = searchsorted(cu_seqlens_q, t, right=True) - 1
+        t = torch.arange(total_q, device=dev, dtype=torch.int32)
+        req = torch.searchsorted(cu_seqlens_q.to(torch.int32), t, right=True) - 1
+        req = req.clamp_min(0)
+        local_j = t - cu_seqlens_q.to(torch.int32)[req]
+        kv_len = context_lens.to(torch.int32)[req] + local_j + 1
+        kv_len = kv_len.clamp_min(0)
+        return (kv_len + BS - 1) // BS  # [total_q] int32
