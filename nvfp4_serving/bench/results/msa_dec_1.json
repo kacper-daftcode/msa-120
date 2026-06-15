@@ -1,0 +1,56 @@
+{
+  "meta": {
+    "host": "http://localhost:8000",
+    "model": "/models/MiniMax-M3-NVFP4",
+    "endpoint": "/v1/completions",
+    "timestamp": "2026-06-15T06:43:30+0000",
+    "conditions": "max-model-len 65536, block-size 128, bf16 KV, TP4, enforce-eager, gpu-mem-util 0.95",
+    "params": {
+      "host": "http://localhost:8000",
+      "model": "/models/MiniMax-M3-NVFP4",
+      "endpoint": "/v1/completions",
+      "input_len": 512,
+      "output_len": 200,
+      "decode_reqs": 8,
+      "prefill_reps": 0,
+      "num_prompts": 0,
+      "concurrency": "",
+      "sweep_output_len": 64,
+      "timeout": 600.0,
+      "health_timeout": 300.0,
+      "seed": 1234,
+      "warmup": 2,
+      "out": "results/msa_dec_1.json",
+      "conditions": null
+    }
+  },
+  "decode_bs1": {
+    "concurrency": 1,
+    "num_prompts": 8,
+    "input_len_requested": 512,
+    "output_len": 200,
+    "completed": 8,
+    "failed": 0,
+    "errors": [],
+    "wall_time_s": 18.1197,
+    "prompt_tokens_total": 4120,
+    "gen_tokens_total": 1600,
+    "mean_prompt_tokens": 515.0,
+    "output_throughput_tok_s": 88.3,
+    "total_throughput_tok_s": 315.68,
+    "request_throughput_req_s": 0.4415,
+    "per_request_decode_tok_s_mean": 88.68,
+    "per_request_decode_tok_s_median": 88.84,
+    "ttft_ms_mean": 20.8,
+    "ttft_ms_median": 20.79,
+    "ttft_ms_p99": 21.31,
+    "tpot_ms_mean": 11.277,
+    "tpot_ms_median": 11.256,
+    "itl_ms_p99": 11.413
+  },
+  "prefill": {
+    "error": "prefill measurement failed",
+    "samples": 0
+  },
+  "sweep": []
+}
