@@ -1,22 +1,18 @@
 #!/usr/bin/env bash
-# Launch MiniMax-M3-NVFP4 with marlin MoE + the SM120 MSA attention path.
+# Serve MiniMax-M3-NVFP4 with marlin MoE + OUR SM120 MSA decode-attend kernel.
 #
-# STATUS (2026-06-14): NOT YET RUNNABLE end-to-end. The SM120 attend/indexer
-# impl swap is blocked on kernel changes A,B,D,E (see RESULTS.md sec 4). The
-# kernels build + run on SM120 and topk is op-equivalence-proven, but the attend
-# cannot consume the M3 paged cache (page 64 vs 128, fused vs split) yet. This
-# script documents the INTENDED launch once those land; today it would fall back
-# to Triton (the selector patch gates on the impl actually being importable).
+# What runs on OUR code: the DECODE main-attention (block-sparse paged flash-
+# decoding, page-128, ldmatrix W4=3) -- the bs1 interactive hot path -- via
+# forward_sparse_decode_serving (graph-capture safe). PREFILL attend + the whole
+# indexer (score+topk) stay on vLLM's Triton path (Phase 1).
 #
-# To restore the marlin production baseline instead, run:
-#   /home/kacper/launch_marlin.sh graph        # the box's prod default (~91 tok/s bs1)
+# Mechanism: mount our overlay package + a sitecustomize.py startup hook that
+# (a) JIT-builds the decode kernel at startup and (b) monkeypatches
+# select_main_impl_cls to return MiniMaxM3SparseSm120Impl on capability-family
+# 120 + bf16 KV + topk16. The MoE/quant overlay is identical to launch_marlin.sh
+# so MoE perf is unchanged.
 #
-# Mechanism (see selector_patch.md): mount our overlay package into the image and
-# import patches.apply() at startup (via a sitecustomize or an --extra-... hook),
-# which monkeypatches select_main_impl_cls / select_indexer_impl_cls to return
-# the SM120 impls on device-capability-family 120 + bf16 KV. The kernels JIT-build
-# on first import via _loader.py (compute_120f; cusparse/cusolver symlink handled
-# by prepare_build_env()).
+# To restore the marlin baseline instead:  /home/kacper/launch_marlin.sh graph
 set -euo pipefail
 
 IMAGE=vllm/vllm-openai:minimax-m3
@@ -31,9 +27,6 @@ EAGER_FLAG=""; [ "$ENFORCE_EAGER" = "eager" ] && EAGER_FLAG="--enforce-eager"
 
 sudo docker rm -f minimax-m3-nvfp4 2>/dev/null || true
 
-# NOTE: the two `-v` lines marked (MSA) mount our overlay + a startup hook. They
-# are commented because the impl swap is not yet runnable; uncomment once
-# blockers A,B,D,E land and the impls import cleanly.
 sudo docker run -d --name minimax-m3-nvfp4 --runtime=nvidia --gpus all \
   --network host --ipc host --shm-size 16g \
   -e VLLM_ALLOW_LONG_MAX_MODEL_LEN=1 \
@@ -41,12 +34,12 @@ sudo docker run -d --name minimax-m3-nvfp4 --runtime=nvidia --gpus all \
   -e VLLM_FORCE_SWIGLU_CLAMP_LIMIT=7.0 \
   -e VLLM_FORCE_SWIGLU_ALPHA=1.702 \
   -e VLLM_FORCE_SWIGLU_BETA=1.0 \
+  -e PYTHONPATH=/opt/sm120/msa_kernels_serving:/opt/sm120 \
   -v "${MODELS}:/models:ro" \
   -v "${PATCH_FIXED}/model.py:${VLLM}/models/minimax_m3/nvidia/model.py:ro" \
   -v "${PATCH_MARLIN}/modelopt.py:${VLLM}/model_executor/layers/quantization/modelopt.py:ro" \
   -v "${PATCH_MARLIN}/marlin_moe.py:${VLLM}/model_executor/layers/fused_moe/experts/marlin_moe.py:ro" \
-  `# -v "${OVERLAY}:/opt/sm120_msa:ro"   (MSA overlay)` \
-  `# -e PYTHONSTARTUP=/opt/sm120_msa/_startup_apply.py   (MSA selector patch)` \
+  -v "${OVERLAY}:/opt/sm120/msa_kernels_serving:ro" \
   "${IMAGE}" \
   --model /models/MiniMax-M3-NVFP4 \
   --tensor-parallel-size 4 \
@@ -58,6 +51,7 @@ sudo docker run -d --name minimax-m3-nvfp4 --runtime=nvidia --gpus all \
   --reasoning-parser minimax_m3 \
   --enable-auto-tool-choice
 
-echo "launched (mode=${ENFORCE_EAGER}). Watch the startup log for the eager-break"
-echo "count: under FULL_AND_PIECEWISE the decode graph is FULL (no per-token break)."
-echo "tail: sudo docker logs -f minimax-m3-nvfp4"
+echo "MSA-decode launched (mode=${ENFORCE_EAGER})."
+echo "Watch for '[sm120-msa] ... MiniMaxM3SparseSm120Impl' + a FULL decode"
+echo "cudagraph capture with no StreamCaptureInvalidated:"
+echo "  sudo docker logs -f minimax-m3-nvfp4"

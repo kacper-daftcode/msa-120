@@ -106,3 +106,15 @@ def perhead_ext():
 def paged_ext():
     """sm120_fmha_paged.cu -> .forward_sparse_paged(...)  (PAGE_SIZE==64 v1)."""
     return _load("sm120_fmha_paged", "sm120_fmha_paged.cu")
+
+
+def decode_serving_ext():
+    """sm120_fmha_decode_serving.cu -> .forward_sparse_decode_serving(...).
+
+    Graph-capture-safe page-128 flash-decoding entrypoint for the LIVE serving
+    path: block_ids [R,Hkv,topk] per-kv-head, seq_lens DEVICE int32 [R], M3 fused
+    cache [num_blocks,2,128,Hkv,128] consumed via real strides (NHD/HND), no
+    host .item() / .contiguous() on the cache. Derived from the validated W4=3
+    _ldsm partial in decode_kernel/sm120_fmha_decode.cu (see that file's banner).
+    """
+    return _load("sm120_fmha_decode_serving", "sm120_fmha_decode_serving.cu")
